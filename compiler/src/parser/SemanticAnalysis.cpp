@@ -42,8 +42,8 @@ Type* AnalysisContext::deduceType(Type* type1, Type* type2, const SourceLocation
     }
 
     if (type1->getTypeTag() == Type::ARRAY && type2->getTypeTag() == Type::ARRAY) {
-        auto arr_1 = dynamic_cast<ArrayType*>(type1);
-        auto arr_2 = dynamic_cast<ArrayType*>(type2);
+        const auto arr_1 = dynamic_cast<ArrayType*>(type1);
+        const auto arr_2 = dynamic_cast<ArrayType*>(type2);
 
         if (arr_1->size != arr_2->size) {
             reportError(
@@ -62,6 +62,10 @@ Type* AnalysisContext::deduceType(Type* type1, Type* type2, const SourceLocation
         }
     }
 
+    if (type1->getTypeTag() == Type::BOOL && type2->getTypeTag() == Type::BOOL) {
+        return type1;
+    }
+
     if (type1->getTypeTag() == Type::REFERENCE || type2->getTypeTag() == Type::REFERENCE) {
         const auto enclosed_type_1 = type1->getTypeTag() == Type::REFERENCE ?
             dynamic_cast<ReferenceType*>(type1)->of_type : type1;
@@ -70,6 +74,12 @@ Type* AnalysisContext::deduceType(Type* type1, Type* type2, const SourceLocation
             dynamic_cast<ReferenceType*>(type2)->of_type : type2;
 
         return deduceType(enclosed_type_1, enclosed_type_2, location);
+    }
+
+    if (type1->getTypeTag() == Type::STR && type2->getTypeTag() == Type::STR) {
+        if (type1->getAggregateSize() > type2->getAggregateSize()) {
+            return type1;
+        } return type2;
     }
 
     reportError(ErrCode::INCOMPATIBLE_TYPES, {.type_1 = type1, .type_2 = type2, .location = location});
@@ -135,12 +145,11 @@ bool AnalysisContext::checkTypeCompatibility(Type* from, Type* to, const SourceL
         const auto* base_t1 = dynamic_cast<ArrayType*>(from);
         const auto* base_t2 = dynamic_cast<ArrayType*>(to);
 
-        if (base_t1->size != base_t2->size) {
-            reportError(ErrCode::DISTINCTLY_SIZED_ARR, {.type_1 = from, .type_2 = to, .location = location});
-            return false;
-        }
-
         return checkTypeCompatibility(base_t1->of_type, base_t2->of_type, location);
+    }
+
+    if (from->getTypeTag() == Type::STR && to->getTypeTag() == Type::STR) {
+        return true;
     }
 
     if (from->getTypeTag() == Type::REFERENCE && to->getTypeTag() == Type::REFERENCE) {
@@ -656,13 +665,26 @@ AnalysisResult Op::analyzeSemantics(AnalysisContext& ctx) {
                 break;
             }
 
+            case LOGICAL_AND:
+            case LOGICAL_OR:
+            case LOGICAL_EQUAL:
+            case LOGICAL_NOTEQUAL:
+            case LOGICAL_NOT:
+            case GREATER_THAN:
+            case GREATER_THAN_OR_EQUAL:
+            case LESS_THAN:
+            case LESS_THAN_OR_EQUAL:
+                ret.deduced_type = &GlobalTypeBool;
+                break;
             default: {
                 ret.deduced_type = ctx.deduceType(analysis_1.deduced_type, analysis_2.deduced_type, location);
             }
         }
     }
 
-    inferred_type = ret.deduced_type;
+    if (arity == 2)
+        common_type = ctx.deduceType(analysis_1.deduced_type, analysis_1.deduced_type, location);
+    else common_type = analysis_1.deduced_type;
     return ret;
 }
 

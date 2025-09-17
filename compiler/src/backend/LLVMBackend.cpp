@@ -23,26 +23,9 @@
 
 
 #define PRE_SETUP() LLVMBackend::SetupHandler GET_UNIQUE_NAME(backend_helper_){instance, this};
-#define SET_BOUND_TYPE_STATE(x) LLVMBackend::BoundTypeStateHelper(instance, x);
+#define SET_BOUND_TYPE_STATE(x) LLVMBackend::BoundTypeStateHelper GET_UNIQUE_NAME(bound_ty)(instance, x);
 
 // ReSharper disable all CppUseStructuredBinding
-
-
-class NewScope {
-    bool prev_ls_cache{};
-    LLVMBackend& instance;
-
-public:
-     explicit NewScope(LLVMBackend& inst): instance(inst) {
-         prev_ls_cache = inst.IsLocalScope;
-         instance.IsLocalScope = true;
-     }
-
-    ~NewScope() {
-         instance.IsLocalScope = prev_ls_cache;
-         instance.ChildHasReturned = false;
-     }
-};
 
 
 LLVMBackend::LLVMBackend(Parser& parser)
@@ -114,15 +97,22 @@ std::string LLVMBackend::mangleString(IdentInfo* id) {
 }
 
 
-void codegenChildrenUntilRet(LLVMBackend& instance, std::vector<std::unique_ptr<Node>>& children) {
+void LLVMBackend::codegenChildrenUntilRet(NodesVec& children) {
     for (const auto& child : children) {
-        if (child->getNodeType() == ND_RET) {
-            child->llvmCodegen(instance);
-            instance.ChildHasReturned = true;
-            return;
-        } if (child->getNodeType() != ND_INVALID) child->llvmCodegen(instance);
+        switch (child->getNodeType()) {
+            case ND_BREAK:
+            case ND_CONTINUE:
+            case ND_RET:
+                child->llvmCodegen(*this);
+                return;
+            case ND_INVALID:
+                continue;
+            default:
+                child->llvmCodegen(*this);
+        }
     }
 }
+
 
 llvm::Value* IntLit::llvmCodegen(LLVMBackend& instance) {
     PRE_SETUP();
@@ -161,24 +151,16 @@ llvm::Value* FloatLit::llvmCodegen(LLVMBackend& instance) {
 
 llvm::Value* StrLit::llvmCodegen(LLVMBackend& instance) {
     PRE_SETUP();
-    auto struct_instance = instance.Builder.CreateAlloca(instance.getBoundLLVMType());
-    auto literal_mem = instance.Builder.CreateStructGEP(instance.getBoundLLVMType(), struct_instance, 0);
-
-    instance.Builder.CreateStore(
-        llvm::ConstantDataArray::getString(instance.Context, value, false),
-        literal_mem
-        );
-
-    return instance.Builder.CreateLoad(instance.getBoundLLVMType(), struct_instance);
+    return llvm::ConstantStruct::get(
+        llvm::dyn_cast<llvm::StructType>(instance.getBoundLLVMType()), {
+        llvm::ConstantDataArray::getString(instance.Context, value, false)
+    });
 }
 
 
 llvm::Value* BoolLit::llvmCodegen(LLVMBackend& instance) {
     PRE_SETUP();
-    return llvm::ConstantInt::get(
-        llvm::Type::getInt1Ty(instance.Context),
-        value
-    );
+    return llvm::ConstantInt::getBool(instance.Context, value);
 }
 
 
@@ -190,7 +172,7 @@ llvm::Value* ArrayLit::llvmCodegen(LLVMBackend& instance) {
     Type* element_type = elements.at(0).expr_type;
     Type* sw_arr_type  = instance.SymMan.getArrayType(element_type, elements.size());
 
-    if (!instance.IsLocalScope) {
+    if (!instance.isLocalScope()) {
         if (instance.BoundMemory) {
             auto arr_type = llvm::ArrayType::get(element_type->llvmCodegen(instance), elements.size());
 
@@ -271,7 +253,7 @@ llvm::Value* Ident::llvmCodegen(LLVMBackend& instance) {
         return e.llvm_value;
     }
 
-    if (!instance.IsLocalScope) {
+    if (!instance.isLocalScope()) {
         auto global_var = llvm::dyn_cast<llvm::GlobalVariable>(e.llvm_value);
         return global_var->getInitializer();
     }
@@ -345,7 +327,6 @@ llvm::Value* Function::llvmCodegen(LLVMBackend& instance) {
 
     llvm::BasicBlock*   entry_bb = llvm::BasicBlock::Create(instance.Context, "entry", func);
 
-    NewScope _(instance);
     instance.Builder.SetInsertPoint(entry_bb);
 
     for (unsigned int i = 0; i < params.size(); i++) {
@@ -356,12 +337,12 @@ llvm::Value* Function::llvmCodegen(LLVMBackend& instance) {
         instance.SymMan.lookupDecl(p_name).llvm_value = func->getArg(i);
     }
 
-    // for (const auto& child : this->children)
-    //     child->codegen();
-
-    codegenChildrenUntilRet(instance, children);
-    if (!instance.Builder.GetInsertBlock()->back().isTerminator())
+    instance.codegenChildrenUntilRet(children);
+    if (!instance.Builder.GetInsertBlock()->back().isTerminator()
+        || instance.Builder.GetInsertBlock()->empty())
         instance.Builder.CreateRetVoid();
+
+    instance.setCurrentParent(nullptr);
     return func;
 }
 
@@ -381,6 +362,9 @@ llvm::Value* ReturnStatement::llvmCodegen(LLVMBackend& instance) {
 
 llvm::Value* Op::llvmCodegen(LLVMBackend& instance) {
     PRE_SETUP();
+    assert(common_type);
+    SET_BOUND_TYPE_STATE(common_type);
+
     switch (op_type) {
         case UNARY_ADD:
             return operands.back()->llvmCodegen(instance);
@@ -536,15 +520,18 @@ llvm::Value* Op::llvmCodegen(LLVMBackend& instance) {
             return instance.Builder.CreateSRem(lhs, rhs);
         }
 
-        case CAST_OP:
-            return operands.at(0)->llvmCodegen(instance);
-
+        case CAST_OP: {
+            assert(operands.at(1)->getNodeType() == ND_TYPE);
+            SET_BOUND_TYPE_STATE(operands.at(1)->getSwType());
+            return instance.castIfNecessary(instance.fetchSwType(
+                operands.at(0)), operands.at(0)->llvmCodegen(instance));
+        }
 
         case LOGICAL_EQUAL: {
             llvm::Value* lhs = operands.at(0)->llvmCodegen(instance);
             llvm::Value* rhs = operands.at(1)->llvmCodegen(instance);
 
-            // assert(lhs->getType() == rhs->getType());
+            assert(lhs->getType() == rhs->getType());
 
             if (lhs->getType()->isFloatingPointTy()) {
                 return instance.Builder.CreateFCmpOEQ(lhs, rhs);
@@ -598,6 +585,8 @@ llvm::Value* Op::llvmCodegen(LLVMBackend& instance) {
             auto lhs_type = instance.fetchSwType(operands.at(0));
             auto rhs_type = instance.fetchSwType(operands.at(1));
 
+            assert(lhs->getType() == rhs->getType());
+
             if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
                 return instance.Builder.CreateFCmpOGT(lhs, rhs);
             }
@@ -615,6 +604,8 @@ llvm::Value* Op::llvmCodegen(LLVMBackend& instance) {
 
             auto lhs_type = instance.fetchSwType(operands.at(0));
             auto rhs_type = instance.fetchSwType(operands.at(1));
+
+            assert(lhs->getType() == rhs->getType());
 
             if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
                 return instance.Builder.CreateFCmpOGE(lhs, rhs);
@@ -634,6 +625,8 @@ llvm::Value* Op::llvmCodegen(LLVMBackend& instance) {
             auto lhs_type = instance.fetchSwType(operands.at(0));
             auto rhs_type = instance.fetchSwType(operands.at(1));
 
+            assert(lhs->getType() == rhs->getType());
+
             if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
                 return instance.Builder.CreateFCmpOLT(lhs, rhs);
             }
@@ -652,6 +645,8 @@ llvm::Value* Op::llvmCodegen(LLVMBackend& instance) {
             auto lhs_type = instance.fetchSwType(operands.at(0));
             auto rhs_type = instance.fetchSwType(operands.at(1));
 
+            assert(lhs->getType() == rhs->getType());
+
             if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
                 return instance.Builder.CreateFCmpOLE(lhs, rhs);
             }
@@ -667,7 +662,7 @@ llvm::Value* Op::llvmCodegen(LLVMBackend& instance) {
             instance.setAssignmentLhsState(true);
             auto lhs = operands.at(0)->llvmCodegen(instance);
             instance.restoreAssignmentLhsState();
-            instance.setBoundTypeState(inferred_type);
+            instance.setBoundTypeState(common_type);
             instance.Builder.CreateStore(operands.at(1)->llvmCodegen(instance), lhs);
             instance.restoreBoundTypeState();
             return nullptr;
@@ -790,6 +785,7 @@ llvm::Value* Op::llvmCodegen(LLVMBackend& instance) {
         auto op = std::make_unique<Op>(std::string_view{value.data(), 1}, 2);
         op->operands.push_back(std::move(operands.at(0)));
         op->operands.push_back(std::move(operands.at(1)));
+        op->common_type = common_type;
 
         instance.setBoundTypeState(instance.fetchSwType(op->operands.at(1)));
         auto rhs = op->llvmCodegen(instance);
@@ -821,7 +817,9 @@ llvm::Value* LLVMBackend::castIfNecessary(Type* source_type, llvm::Value* subjec
 
     if (getBoundTypeState() != source_type && source_type->getTypeTag() != Type::STRUCT) {
         if (getBoundTypeState()->isIntegral() || getBoundTypeState()->getTypeTag() == Type::BOOL) {
-            if (getBoundTypeState()->isUnsigned()) {
+            // if the destination type is unsigned or if the source type is boolean
+            // perform a zero-extension or truncation
+            if (getBoundTypeState()->isUnsigned() || source_type->getTypeTag() == Type::BOOL) {
                 return Builder.CreateZExtOrTrunc(subject, getBoundLLVMType());
             } return Builder.CreateSExtOrTrunc(subject, getBoundLLVMType());
         }
@@ -877,9 +875,8 @@ llvm::Value* Condition::llvmCodegen(LLVMBackend& instance) {
     instance.Builder.CreateCondBr(if_cond, if_block, else_block);
 
     {
-        NewScope if_scp{instance};
         instance.Builder.SetInsertPoint(if_block);
-        codegenChildrenUntilRet(instance, if_children);
+        instance.codegenChildrenUntilRet(if_children);
 
         // insert a jump to the merge block if the scope either doesn't end with a
         // terminator or is empty
@@ -889,11 +886,9 @@ llvm::Value* Condition::llvmCodegen(LLVMBackend& instance) {
     }
 
     {
-        NewScope else_scp{instance};
         instance.Builder.SetInsertPoint(else_block);
 
         for (auto& [condition, children] : elif_children) {
-            NewScope elif_scp{instance};
             const auto cnd = condition.llvmCodegen(instance);
 
             auto elif_block = llvm::BasicBlock::Create(instance.Context, "elif", parent);
@@ -901,7 +896,7 @@ llvm::Value* Condition::llvmCodegen(LLVMBackend& instance) {
 
             instance.Builder.CreateCondBr(cnd, elif_block, next_elif);
             instance.Builder.SetInsertPoint(elif_block);
-            codegenChildrenUntilRet(instance, children);
+            instance.codegenChildrenUntilRet(children);
 
             // insert a jump to the merge block if the scope either doesn't end with a
             // terminator or is empty
@@ -912,7 +907,7 @@ llvm::Value* Condition::llvmCodegen(LLVMBackend& instance) {
             instance.Builder.SetInsertPoint(next_elif);
         }
 
-        codegenChildrenUntilRet(instance, else_children);
+        instance.codegenChildrenUntilRet(else_children);
 
         // insert a jump to the merge block if the scope either doesn't end with a
         // terminator or is empty
@@ -943,17 +938,30 @@ llvm::Value* WhileLoop::llvmCodegen(LLVMBackend& instance) {
     const auto expr  = condition.llvmCodegen(instance);
     instance.Builder.CreateCondBr(expr, body_block, merge_block);
 
+    instance.setLoopMetadata({.break_to = merge_block, .continue_to = cond_block});
+
     {
-        NewScope _(instance);
         instance.Builder.SetInsertPoint(body_block);
-        codegenChildrenUntilRet(instance, children);
+        instance.codegenChildrenUntilRet(children);
+
+        if (!instance.Builder.GetInsertBlock()->back().isTerminator() ||
+            instance.Builder.GetInsertBlock()->empty())
         instance.Builder.CreateBr(cond_block);
     }
 
+    instance.restoreLoopMetadata();
     instance.Builder.SetInsertPoint(merge_block);
     return nullptr;
 }
 
+
+llvm::Value* BreakStmt::llvmCodegen(LLVMBackend& instance) {
+    return instance.Builder.CreateBr(instance.getLoopMetadata().break_to);
+}
+
+llvm::Value* ContinueStmt::llvmCodegen(LLVMBackend& instance) {
+    return instance.Builder.CreateBr(instance.getLoopMetadata().continue_to);
+}
 
 llvm::Value* Struct::llvmCodegen(LLVMBackend& instance) {
     PRE_SETUP();
@@ -1024,9 +1032,9 @@ llvm::Value* FuncCall::llvmCodegen(LLVMBackend& instance) {
 llvm::Value* Var::llvmCodegen(LLVMBackend& instance) {
     PRE_SETUP();
     assert(var_type != nullptr);
-    if (is_comptime) { return nullptr; }
 
     llvm::Type* type = var_type->llvmCodegen(instance);
+    assert(type != nullptr);
 
     llvm::Value* init = nullptr;
 
@@ -1034,7 +1042,7 @@ llvm::Value* Var::llvmCodegen(LLVMBackend& instance) {
         llvm::GlobalVariable::ExternalLinkage : llvm::GlobalVariable::InternalLinkage;
 
 
-    if (!instance.IsLocalScope) {
+    if (!instance.isLocalScope()) {
         auto var_name = is_extern ? var_ident->toString() : instance.mangleString(var_ident);
         auto* var = new llvm::GlobalVariable(
                 *instance.LModule, type, is_const, linkage,
