@@ -55,7 +55,7 @@ jobs:
             # set PATH for llvm tools
             echo "LLVM_DIR=$HOME/llvm/lib/cmake/llvm" >> $GITHUB_ENV
             echo "LLD_DIR=$HOME/llvm/lib/cmake/lld" >> $GITHUB_ENV
-            ls -R "$HOME/llvm/lib"
+            echo $LLVM_DIR
             ls -R "$HOME/llvm/"
             echo $LLD_DIR
           fi
