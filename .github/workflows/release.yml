@@ -55,7 +55,7 @@ jobs:
             # set PATH for llvm tools
             echo "LLVM_DIR=$HOME/llvm/lib/cmake/llvm" >> $GITHUB_ENV
             echo "LLD_DIR=$HOME/llvm/lib/cmake/lld" >> $GITHUB_ENV
-            ls -R "$HOME/llvm/lib/cmake/lld"
+            ls -R "$HOME/llvm/lib/cmake"
             echo $LLD_DIR
           fi
           if [ "${{ matrix.os }}" == "windows-latest" ]; then
