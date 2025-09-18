@@ -49,7 +49,7 @@ jobs:
       - name: Download LLVM
         run: |
           if [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
-            curl -L -o llvm-linux.tar.gz https://github.com/SwirlLang/llvm-builds/releases/download/20.1.8/LLVM-20.1.8-linux-x86_64-clang.tar.gz
+            curl -L -o llvm-linux.tar.gz https://github.com/SwirlLang/llvm-builds/releases/download/20.1.8/LLVM-20.1.8-linux-x86_64-gcc.tar.gz
             mkdir -p $HOME/llvm
             tar -xzf llvm-linux.tar.gz -C $HOME/llvm
             # set PATH for llvm tools
@@ -67,7 +67,6 @@ jobs:
       - name: Install dependencies and Configure CMake
         run: |
             if [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
-                sudo apt install lld
                 cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -S . -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14
             fi
             if [ "${{ matrix.os }}" == "windows-latest" ]; then
