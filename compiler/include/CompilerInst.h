@@ -3,30 +3,29 @@
 #include <utility>
 #include <filesystem>
 #include <unordered_set>
-#include <llvm/Support/ThreadPool.h>
 
 #include "parser/Parser.h"
+#include "utils/Threadpool.h"
 #include "backend/LLVMBackend.h"
 #include "errors/ErrorPipeline.h"
 #include "managers/ModuleManager.h"
 
 
 namespace fs = std::filesystem;
-using ThreadPool = llvm::StdThreadPool;
+using ThreadPool = sw::ThreadPool;
 
 
 class CompilerInst {
-    ThreadPool    m_ThreadPool;
-    SourceManager m_SourceManager;
-    ErrorManager  m_ErrorManager;
-    ModuleManager m_ModuleManager;
+    ThreadPool     m_ThreadPool;
+    ErrorManager   m_ErrorManager;
+    ModuleManager  m_ModuleManager;
 
     fs::path      m_SrcPath;
     fs::path      m_OutputPath;     // path/to/executable (absolute)
     unsigned      m_BaseThreadCount = std::thread::hardware_concurrency() / 2;
 
-    std::optional<Parser> m_MainModParser = std::nullopt;
-    ErrorCallback_t       m_ErrorCallback = nullptr;
+    Parser* m_MainModParser = nullptr;
+    ErrorCallback_t         m_ErrorCallback = nullptr;
 
     using Backends_t = std::vector<std::unique_ptr<LLVMBackend>>;
 
@@ -48,7 +47,7 @@ public:
     inline static std::unordered_map<std::string, PackageInfo> PackageTable;
 
 
-    explicit CompilerInst(fs::path path) : m_SourceManager(path), m_SrcPath(std::move(path)) {
+    explicit CompilerInst(fs::path path) : m_SrcPath(std::move(path)) {
         m_ErrorCallback = [this](const ErrCode code, const ErrorContext& ctx) {
             m_ErrorManager.newErrorLocked(code, ctx);
         };
@@ -57,6 +56,9 @@ public:
 
     void setBaseThreadCount(const std::string& count) {
         m_BaseThreadCount = static_cast<unsigned>(std::stoi(count));
+        if (m_BaseThreadCount) {
+            m_ThreadPool.setBaseThreadCount(m_BaseThreadCount);
+        }
     }
 
     void setErrorPipeline(ErrorPipeline* pipeline) {
@@ -83,16 +85,15 @@ public:
             m_ErrorManager.m_OutputPipeline = &err_pipeline;
         }
 
-        m_MainModParser.emplace(m_SrcPath, m_ErrorCallback, m_ModuleManager);
+        m_MainModParser = new Parser(m_SrcPath, m_ErrorCallback, m_ModuleManager);
         m_MainModParser->toggleIsMainModule();
-        m_ModuleManager.setMainModParser(&(*m_MainModParser));
+        m_ModuleManager.setMainModParser(m_MainModParser);
 
         m_MainModParser->parse();
 
         // check for parser errors and abort if present
         if (m_ErrorManager.errorOccurred()) {
             m_ErrorManager.flush();
-            std::exit(1);
         }
 
         // || --- *---*   Sema   *---* --- || //
@@ -102,7 +103,7 @@ public:
 
             while (const auto mod = m_ModuleManager.popZeroDepVec()) {
                 std::print("{}, ", mod->m_FilePath.string());
-                m_ThreadPool.async([mod] {
+                m_ThreadPool.enqueue([mod] {
                     mod->performSema();
                 });
             }
@@ -116,7 +117,6 @@ public:
         // check for Sema errors and abort if present
         if (m_ErrorManager.errorOccurred()) {
             m_ErrorManager.flush();
-            std::exit(1);
         }
 
         startLLVMCodegen();

@@ -25,6 +25,7 @@ std::unique_ptr<Node> ExpressionParser::parseComponent() {
             m_Parser.forwardStream();
             return ret;
         }
+
         case STRING: {
             auto str = std::make_unique<StrLit>(m_Stream.CurTok.value);
             SET_NODE_ATTRS(str.get());
@@ -36,6 +37,7 @@ std::unique_ptr<Node> ExpressionParser::parseComponent() {
             }
             return str;
         }
+
         case IDENT: {
             auto id = std::make_unique<Ident>(m_Parser.parseIdent());
             SET_NODE_ATTRS(id.get());
@@ -46,7 +48,20 @@ std::unique_ptr<Node> ExpressionParser::parseComponent() {
                 return call_node;
             } return id;
         }
+
+        case KEYWORD: {
+            if (m_Stream.CurTok.value == "true" || m_Stream.CurTok.value == "false") {
+                auto ret = std::make_unique<BoolLit>(m_Stream.CurTok.value == "true");
+                SET_NODE_ATTRS(ret.get());
+                m_Parser.forwardStream();
+                return ret;
+            }
+        }
+
         case PUNC: {
+            if (m_Stream.CurTok.value == "@")
+                return m_Parser.parseIntrinsic();
+
             if (m_Stream.CurTok.value == "[") {
                 auto arr_node = std::make_unique<ArrayLit>();
                 SET_NODE_ATTRS(arr_node.get());
@@ -74,18 +89,15 @@ std::unique_ptr<Node> ExpressionParser::parseComponent() {
                 SET_NODE_ATTRS(ret.get());
                 m_Parser.forwardStream();
                 return ret;
-            } return m_Parser.dispatch();
-        }
-        case KEYWORD: {
-            if (m_Stream.CurTok.value == "true" || m_Stream.CurTok.value == "false") {
-                auto ret = std::make_unique<BoolLit>(m_Stream.CurTok.value == "true");
-                SET_NODE_ATTRS(ret.get());
-                m_Parser.forwardStream();
-                return ret;
             }
+
+            m_Parser.forwardStream();
+            m_Parser.reportError(ErrCode::EXPECTED_EXPRESSION);
+            return nullptr;
         }
 
         default: {
+            m_Parser.forwardStream();
             m_Parser.reportError(ErrCode::EXPECTED_EXPRESSION);
             return nullptr;
         }
@@ -99,6 +111,15 @@ std::unique_ptr<Node> ExpressionParser::parsePrefix() {
         auto op = std::make_unique<Op>(m_Stream.CurTok.value, 1);
         SET_NODE_ATTRS(op.get());
         m_Parser.forwardStream();
+
+        if (m_Stream.CurTok.type == KEYWORD && m_Stream.CurTok.value == "mut") {
+            if (op->op_type != Op::ADDRESS_TAKING) {
+                m_Parser.reportError(ErrCode::SYNTAX_ERROR, {
+                    .msg = "`mut` can only appear after the `&` operator."
+                });
+            } else op->is_mutable = true;
+            m_Parser.forwardStream();
+        }
 
         auto rhs = parseExpr(Op::getPBPFor(Op::getTagFor(op->value, 1)));
         op->operands.push_back(std::make_unique<Expression>(std::move(rhs)));
@@ -124,8 +145,7 @@ Expression ExpressionParser::parseExpr(const int rbp) {
                 m_Parser.ignoreButExpect({PUNC, "]"});
                 break;
             case Op::CAST_OP: {
-                const auto dummy_node = new TypeWrapper();
-                dummy_node->type = m_Parser.parseType();
+                const auto dummy_node = new TypeWrapper(m_Parser.parseType());
                 right = Expression::makeExpression(dummy_node);
                 break;
             }
@@ -160,3 +180,17 @@ Expression ExpressionParser::parseExpr(const int rbp) {
 
     return ret;
 }
+
+
+struct SaveStreamState {
+    explicit SaveStreamState(TokenStream& stream): stream(stream) {
+        stream.setReturnPoint();
+    }
+
+    ~SaveStreamState() {
+        stream.restoreCache();
+    }
+
+private:
+    TokenStream& stream;
+};

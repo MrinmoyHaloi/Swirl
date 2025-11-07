@@ -5,9 +5,10 @@
 #include <concepts>
 #include <filesystem>
 #include <unordered_set>
+#include <print>
 
 #include "definitions.h"
-#include "parser/Nodes.h"
+#include "ast/Nodes.h"
 #include "lexer/Tokens.h"
 #include "lexer/TokenStream.h"
 #include "errors/ErrorManager.h"
@@ -19,7 +20,6 @@
 class Parser;
 class ModuleManager;
 class AnalysisContext;
-using ErrorCallback_t = std::function<void (ErrCode, ErrorContext)>;
 
 
 /// A type which can represent either a `Type*` or a `Node*`.
@@ -65,9 +65,11 @@ class Parser {
     // ---*--- Flags  ---*---
     Function*    m_LatestFuncNode = nullptr;
     bool         m_LastSymWasExported = false;
-    bool         m_LastSymIsExtern  = false;
-    bool         m_IsMainModule     = false;    // is the module the parser represents the main one?
+    bool         m_LastSymIsExtern    = false;
+    bool         m_IsMainModule       = false;    // is the module the parser represents the main one?
+    bool         m_IsBeingCloned      = false;
 
+    std::size_t  m_CloneCount = 0;
     std::vector<Type*> m_CurrentStructTy{nullptr};  // the type of the struct being parsed
 
     std::string m_ExternAttributes;
@@ -87,6 +89,10 @@ class Parser {
     // used for buffering error reports until the nodes/types have been completed
     std::unordered_map<SwObject, std::vector<std::tuple<ErrCode, ErrorContext>>> m_ErrorQueue;
 
+    // maps the IdentInfo* of global nodes (nodes inheriting from `GlobalNode`) to where they begin and
+    // where they end
+    std::unordered_map<IdentInfo*, std::array<StreamState, 2>> m_GlobalOffsets;
+
     struct Bracket_t { char val{}; StreamState location; };
     std::vector<Bracket_t> m_BracketTracker;
 
@@ -97,6 +103,7 @@ class Parser {
     friend class LLVMBackend;
     friend class AnalysisContext;
     friend class ExpressionParser;
+    friend class ClonedState;
 
 
 public:
@@ -107,6 +114,7 @@ public:
 
     explicit Parser(const std::filesystem::path& path, ErrorCallback_t, ModuleManager&);
 
+    using GenericArgList_t = std::vector<TypeWrapper>;
 
     std::unique_ptr<Node>            dispatch();
     std::unique_ptr<Function>        parseFunction();
@@ -116,15 +124,25 @@ public:
     std::unique_ptr<ImportNode>      parseImport();
     std::unique_ptr<Scope>           parseScope();
     std::unique_ptr<ReturnStatement> parseRet();
+    std::unique_ptr<Intrinsic>       parseIntrinsic();
+    std::unique_ptr<Protocol>        parseProtocol();
 
+    Var parseParam(bool&);
     std::unique_ptr<Var>      parseVar(bool is_volatile = false);
     std::unique_ptr<FuncCall> parseCall(std::optional<Ident> _ = std::nullopt);
 
+    std::vector<Ident>                parseProtocolList();
+    std::vector<GenericParam>         parseGenericParamList();
+
+    // Returns the clone of the node with the `IdentInfo*` `id`
+    std::unique_ptr<Node> cloneNode(IdentInfo* id);
+
     Token forwardStream(uint8_t n = 1);
 
-    Type*      parseType();
-    Ident      parseIdent();
-    Expression parseExpr();
+    Ident            parseIdent();
+    Expression       parseExpr();
+    TypeWrapper      parseType();
+    GenericArgList_t parseGenericArgList();
 
     void parse();
     void performSema();
@@ -132,6 +150,10 @@ public:
     void stackSafeguard() const;
 
     void toggleIsMainModule() { m_IsMainModule = !m_IsMainModule; }
+
+    std::size_t getCloneCount() {
+        return ++m_CloneCount;
+    }
 
     /// Calls `inserter` with the symbol name for each exported-symbol in the AST
     template <typename Inserter_t> requires std::invocable<Inserter_t, std::string>
@@ -173,6 +195,8 @@ struct Parser::NodeAttrHelper {
             const auto glob = dynamic_cast<GlobalNode*>(node);
             glob->is_extern = instance.m_LastSymIsExtern;
             glob->extern_attributes = instance.m_ExternAttributes;
+
+            begins_from = instance.m_Stream.getStreamState();
         }
     }
 
@@ -186,6 +210,16 @@ struct Parser::NodeAttrHelper {
 
         if (node) {
             node->location.to = instance.m_Stream.getStreamState();
+
+            if (node->isGlobal()) {
+                auto node_id = node->getIdentInfo();
+
+                assert(node_id != nullptr);
+                assert(begins_from.has_value());
+
+                instance.m_GlobalOffsets.insert({node_id, {
+                    begins_from.value(), instance.m_Stream.getStreamState()}});
+            }
         }
 
         // flush all the errors
@@ -205,4 +239,5 @@ private:
     Type*   type = nullptr;
 
     Parser& instance;
+    std::optional<StreamState> begins_from = std::nullopt;
 };

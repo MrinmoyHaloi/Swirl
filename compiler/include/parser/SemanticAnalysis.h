@@ -12,7 +12,6 @@ class SourceManager;
 /// association with a `Parser` instance, `startAnalysis` is then called to begin sema.
 class AnalysisContext {
 public:
-    std::unordered_map<Node*, AnalysisResult> Cache;
     std::unordered_map<IdentInfo*, Node*>& GlobalNodeJmpTable;
 
     SymbolManager& SymMan;
@@ -20,6 +19,8 @@ public:
     SourceManager* SrcMan;
 
     ErrorCallback_t ErrCallback;
+
+    std::unordered_set<std::string> CurGenericArgNames;
 
     explicit AnalysisContext(Parser& parser)
     : GlobalNodeJmpTable(parser.NodeJmpTable)
@@ -29,7 +30,7 @@ public:
     , ErrCallback(parser.m_ErrorCallback)
     , m_AST(parser.AST)
     {
-        m_IsMethodCall.emplace(false);
+        m_IsMethodCall.push(nullptr);
         m_BoundTypeState.emplace(nullptr);
         SymMan.setErrorCallback([this](auto code, const auto& ctx) {
             reportError(code, ctx);
@@ -91,18 +92,19 @@ public:
     // it's a regular function call or a method-call.
 
     /// Returns the current value of the state
-    bool getIsMethodCallState() const {
+    IdentInfo* getIsMethodCallState() const {
         assert(!m_IsMethodCall.empty());
         return m_IsMethodCall.top();
     }
 
     /// Changes the value of the state to `val`
-    void setIsMethodCallState(const bool val) {
-        m_IsMethodCall.push(val);
+    void setIsMethodCallState(IdentInfo* method_id) {
+        m_IsMethodCall.push(method_id);
     }
 
     /// Restores the state to its previous value
     void restoreIsMethodCallState() {
+        assert(!m_IsMethodCall.empty());
         m_IsMethodCall.pop();
     }
 
@@ -135,6 +137,10 @@ public:
     /// Returns the common-type of `type1` and `type2`, nullptr if failure
     Type* deduceType(Type* type1, Type* type2, const SourceLocation& location) const;
 
+    /// Returns the `Type*` of the value that the node will yield upon evaluation
+    Type* getEvalType(const SwNode& node) const;
+    Type* getEvalType(Node* node) const;
+
     /// Checks whether `from` can be converted to `to`, returns `false` if incompatible
     bool checkTypeCompatibility(Type* from, Type* to, const SourceLocation& location) const;
 
@@ -147,8 +153,8 @@ public:
 private:
     AST_t& m_AST;
 
-    std::stack<Type*> m_BoundTypeState;
-    std::stack<bool>  m_IsMethodCall;
+    std::stack<Type*>      m_BoundTypeState;
+    std::stack<IdentInfo*> m_IsMethodCall;
     std::stack<Node*> m_NodeStack;
 
     Node* m_CurrentParentFunc = nullptr;
@@ -178,10 +184,26 @@ private:
 struct AnalysisContext::SemaSetupHandler {
     SemaSetupHandler(AnalysisContext& ctx, Node* node): node(node), ctx(ctx) {
         ctx.m_NodeStack.push(node);
+
+        if (const auto glob = node->to<GlobalNode>()) {
+            for (auto& arg : glob->generic_params) {
+                if (ctx.CurGenericArgNames.contains(arg.name)) {
+                    throw std::runtime_error("generic duplication!");
+                }
+
+               ctx.CurGenericArgNames.insert(arg.name);
+            }
+        }
     }
 
     ~SemaSetupHandler() {
         ctx.m_NodeStack.pop();
+
+        if (const auto glob = node->to<GlobalNode>()) {
+            for (auto& arg : glob->generic_params) {
+                ctx.CurGenericArgNames.erase(arg.name);
+            }
+        }
     }
 
 private:

@@ -16,17 +16,10 @@ std::string StructType::toString() const {
 }
 
 std::string PointerType::toString() const {
-    std::string ret = (is_mutable ? "mut " : "") + of_type->toString();
-    for (int i = 0; i < pointer_level; i++) {
-        ret.append("*");
-    } return ret;
+    return is_mutable
+        ? "mut " + of_type->toString() + '*'
+        : "" + of_type->toString() + '*';
 }
-
-
-Type* TypeStr::getWrappedType() {
-    return &GlobalTypeChar;
-}
-
 
 llvm::Type* FunctionType::llvmCodegen(LLVMBackend& instance) {
     std::vector<llvm::Type*> llvm_param_types;
@@ -49,10 +42,11 @@ llvm::Type* TypeStr::llvmCodegen(LLVMBackend& instance) {
         return instance.LLVMTypeCache[this];
     }
 
-    auto lit_arr = llvm::ArrayType::get(GlobalTypeChar.llvmCodegen(instance), size);
-
-    const auto ret = llvm::StructType::create(instance.Context, "__Str");
-    ret->setBody({lit_arr});
+    llvm::StructType* ret = llvm::StructType::create(instance.Context, "__Sw_StrRef");
+    ret->setBody({
+        PointerType{&GlobalTypeChar, false}.llvmCodegen(instance),
+        GlobalTypeI64.llvmCodegen(instance)
+    });
 
     instance.LLVMTypeCache[this] = ret;
     return ret;
@@ -95,7 +89,7 @@ llvm::Type* SliceType::llvmCodegen(LLVMBackend& instance) {
     );
 
     struct_t->setBody({
-        instance.SymMan.getPointerType(of_type, 1)
+        instance.SymMan.getPointerType(of_type, false)
             ->llvmCodegen(instance),  // pointer to the first element
         llvm::Type::getInt64Ty(instance.Context)  // size
     });
@@ -180,7 +174,7 @@ llvm::Type* TypeBool::llvmCodegen(LLVMBackend& instance) {
 #define DEFINE_CTYPE_DEF(Name, BitWidth, IsIntegral) \
     unsigned int  Name::getBitWidth() { return BitWidth; } \
     bool Name::isIntegral() { return IsIntegral; } \
-    bool Name::isFloatingPoint() { return !IsIntegral; } \
+    bool Name::isFloatingPoint() { return !(IsIntegral); } \
     llvm::Type* Name::llvmCodegen(LLVMBackend& _) { \
         return llvm::Type::getIntNTy(_.Context, BitWidth); \
         }

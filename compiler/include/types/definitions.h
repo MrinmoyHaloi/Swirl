@@ -28,6 +28,9 @@ inline TypeChar  GlobalTypeChar{};
 
 inline VoidType  GlobalTypeVoid{};
 
+inline TypeStr   GlobalTypeStr;
+inline TypeStr   GlobalTypeMutStr{true};
+
 
 // C Types
 inline TypeCInt       GlobalTypeCInt{false};
@@ -77,6 +80,7 @@ std::unordered_map<std::string_view, Type*> BuiltinTypes = {
     {"bool", &GlobalTypeBool},
     {"char", &GlobalTypeChar},
 
+    {"str", &GlobalTypeStr},
     {"void", &GlobalTypeVoid},
 
 

@@ -6,7 +6,7 @@
 #include <unordered_set>
 
 #include "parser/Parser.h"
-#include "parser/Nodes.h"
+#include "ast/Nodes.h"
 #include "symbols/SymbolManager.h"
 
 #include <llvm/IR/IRBuilder.h>
@@ -34,6 +34,7 @@ public:
     llvm::LLVMContext Context;
     llvm::IRBuilder<> Builder{Context};
 
+    ::ModuleManager& ModuleManager;
     std::unique_ptr<llvm::Module> LModule;
 
     std::vector<std::unique_ptr<Node>> AST;
@@ -60,6 +61,11 @@ public:
         llvm::BasicBlock* continue_to = nullptr;
     };
 
+    // holds states which are specific to each call
+    struct StackState {
+        std::vector<bool> is_lvalue = {false};
+    };
+
     /// Calculates and returns a mangled string which corresponds to the `IdentInfo*`
     std::string mangleString(IdentInfo*);
 
@@ -67,8 +73,10 @@ public:
     /// note: `subject` is supposed to be a "loaded" value
     llvm::Value* castIfNecessary(Type* source_type, llvm::Value* subject);
 
-    /// Codegens the vector of nodes while respecting statements like `return`.
-    void codegenChildrenUntilRet(NodesVec& children);
+    /// Codegens the vector of nodes while respecting statements like `return`. If `condition` is not
+    /// nullptr, checks whether it is a `ConstantInt`, and if so, whether it is 0 (in which case no
+    /// code generation takes place).
+    void codegenChildrenUntilRet(NodesVec& children, llvm::Value* condition = nullptr);
 
     /// Begins the IR generation
     void startGeneration() {
@@ -81,9 +89,13 @@ public:
 
     /// Tries to fetch the swirl-type of the node, throws an exception on failure
     Type* fetchSwType(const std::unique_ptr<Node>& node) const {
+        return fetchSwType(node.get());
+    }
+
+    Type* fetchSwType(Node* node) const {
         switch (node->getNodeType()) {
             case ND_STR:
-                return SymMan.getStrType(dynamic_cast<StrLit*>(node.get())->value.size());
+                return &GlobalTypeStr;
             case ND_INT:
                 return &GlobalTypeI32;
             case ND_FLOAT:
@@ -119,11 +131,6 @@ public:
         return m_LatestBoundType.top();
     }
 
-    bool getAssignmentLhsState() const {
-        assert(!m_AssignmentLhsStack.empty());
-        return m_AssignmentLhsStack.top();
-    }
-
     llvm::Type* getBoundLLVMType() {
         assert(m_LatestBoundType.top() != nullptr);
         return m_LatestBoundType.top()->llvmCodegen(*this);
@@ -144,14 +151,6 @@ public:
     void setBoundTypeState(Type* to) {
         assert(to != nullptr);
         m_LatestBoundType.emplace(to);
-    }
-
-    void setAssignmentLhsState(bool value) {
-        m_AssignmentLhsStack.emplace(value);
-    }
-
-    void restoreAssignmentLhsState() {
-        m_AssignmentLhsStack.pop();
     }
 
     void restoreBoundTypeState() {
@@ -200,15 +199,20 @@ private:
     llvm::Function* m_CurParent = nullptr;
 
     std::stack<Type*>           m_LatestBoundType;
-    std::stack<bool>            m_AssignmentLhsStack;
     std::stack<LoopMetadata>    m_LoopMetadataStack;
     std::stack<ManglingContext> m_ManglingContexts;
+    std::stack<StackState>      m_CodegenStack;
 };
 
 
 struct LLVMBackend::SetupHandler {
-    SetupHandler(LLVMBackend& instance, Node* ptr): instance(instance), node(ptr) {}
-    ~SetupHandler() = default;
+    SetupHandler(LLVMBackend& instance, Node* ptr): instance(instance), node(ptr) {
+        instance.m_CodegenStack.emplace();
+    }
+
+    ~SetupHandler() {
+        instance.m_CodegenStack.pop();
+    }
 
 private:
     LLVMBackend& instance;

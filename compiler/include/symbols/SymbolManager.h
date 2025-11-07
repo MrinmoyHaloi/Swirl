@@ -1,17 +1,17 @@
 #pragma once
-#include <filesystem>
 #include <string>
 #include <ranges>
-#include <unordered_map>
 #include <utility>
+#include <filesystem>
+#include <unordered_map>
 
 #include "metadata.h"
 
-#include <types/definitions.h>
-#include <types/TypeManager.h>
-#include <symbols/IdentManager.h>
-#include <errors/ErrorManager.h>
-#include <llvm/IR/Value.h>
+#include "types/definitions.h"
+#include "types/TypeManager.h"
+#include "symbols/IdentManager.h"
+#include "errors/ErrorManager.h"
+#include "llvm/ADT/STLExtras.h"
 
 
 struct ErrorContext;
@@ -49,18 +49,17 @@ public:
 
 class SymbolManager {
     bool m_LockEmplace = false;
-    // std::size_t m_ScopeInt = 0;
 
     TypeManager m_TypeManager;
     ModuleManager& m_ModuleMap;
 
-    std::list<Namespace>    m_Scopes;       // for stable-addressing of the scopes
+    std::list<Namespace>    m_Scopes;       // for the stable-addressing of the namespaces
     std::vector<Namespace*> m_ScopeTrack;  // for tracking the insert-points
 
     std::unordered_map<IdentInfo*, TableEntry> m_IdToTableEntry;
 
     std::filesystem::path m_ModulePath;
-    std::unordered_map<std::string, IdentInfo*> m_ImportedSymsIDTable;
+    std::unordered_map<std::string, IdentInfo*> m_ImportedSymIDTable;
 
     // tracks the exported symbols of the mod
     std::unordered_map<std::string, ExportedSymbolMeta_t> m_ExportedSymbolTable;
@@ -70,8 +69,17 @@ class SymbolManager {
 
     ErrorCallback_t m_ErrorCallback;
 
-
 public:
+    inline static const std::unordered_map<Intrinsic::Kind, IntrinsicDef> IntrinsicTable = {
+        {Intrinsic::TYPEOF,  IntrinsicDef{}},
+        {Intrinsic::SIZEOF,  IntrinsicDef{.return_type = &GlobalTypeI64}},
+        {Intrinsic::MEMCPY,  IntrinsicDef{.return_type = &GlobalTypeVoid}},
+        {Intrinsic::MEMSET,  IntrinsicDef{.return_type = &GlobalTypeVoid}},
+        {Intrinsic::ADV_PTR, IntrinsicDef{}}
+    };
+
+    static std::unordered_map<Type*, std::function<void(Namespace*, SymbolManager&)>> DefaultTypeMethods;
+
      explicit SymbolManager(std::filesystem::path uid, ModuleManager& module_man, ErrorCallback_t err_c)
         : m_ModuleMap(module_man)
         , m_ModulePath(std::move(uid))
@@ -79,7 +87,6 @@ public:
     {
         // Create the global scope
         m_ScopeTrack.push_back(&m_Scopes.emplace_back(m_ModulePath));
-
         // Register all built-in types in the global scope
         for (const auto &[str, type] : BuiltinTypes) {
             const auto id = m_ScopeTrack.back()->getNewIDInfo(std::string(str));
@@ -98,8 +105,8 @@ public:
 
         // when this flag is true, look only in the exported id's rather than every foreign id
         if (!enforce_export) {
-            if (m_ImportedSymsIDTable.contains(name))
-                return m_ImportedSymsIDTable[name];
+            if (m_ImportedSymIDTable.contains(name))
+                return m_ImportedSymIDTable[name];
         } else if (m_ExportedSymbolTable.contains(name))
             return m_ExportedSymbolTable[name].id;
 
@@ -118,8 +125,12 @@ public:
         } return nullptr;
     }
 
-    IdentInfo* getIDInfoFor(const Ident& id, const std::optional<ErrorCallback_t>& err_callback = std::nullopt);
+    IdentInfo* getIDInfoFor(
+        const Ident& id,
+        const std::optional<ErrorCallback_t>& err_callback = std::nullopt,
+        const std::optional<ErrorCallback_t>& generic_err_callback = std::nullopt);
 
+    IdentInfo* instantiateGenerics(IdentInfo* id, const std::vector<TypeWrapper*>& args, const ErrorCallback_t&);
 
     /// returns the global scope's pointer
     Namespace* getGlobalScope() const {
@@ -140,7 +151,7 @@ public:
 
     /// makes the symbol manager aware of the IDs of foreign (imported) symbols
     void registerForeignID(const std::string& name, IdentInfo* id, const bool is_exported = false) {
-        m_ImportedSymsIDTable.emplace(name, id);
+        m_ImportedSymIDTable.emplace(name, id);
         if (is_exported)
             registerExportedSymbol(name, {.id = id});
     }
@@ -152,8 +163,10 @@ public:
     }
 
 
-    Type* getReferenceType(Type* of_type, const bool is_mutable) {
-        return m_TypeManager.getReferenceType(of_type, is_mutable);
+    Type* getReferenceType(Type* of_type, const bool is_mutable, const bool is_str_ref = false) {
+        if (is_str_ref) {
+            return getSliceType(&GlobalTypeChar, is_mutable);
+        } return m_TypeManager.getReferenceType(of_type, is_mutable);
     }
 
     /// (of_type, is_mutable) -> &[of_type]
@@ -165,12 +178,8 @@ public:
         return m_TypeManager.getArrayType(of_type, size);
     }
 
-    Type* getStrType(const std::size_t size) {
-        return m_TypeManager.getStringType(size);
-    }
-
-    Type* getPointerType(Type* of_type, const uint16_t ptr_level) {
-        return m_TypeManager.getPointerType(of_type, ptr_level);
+    Type* getPointerType(Type* of_type, const bool is_mutable) {
+        return m_TypeManager.getPointerType(of_type, is_mutable);
     }
 
 

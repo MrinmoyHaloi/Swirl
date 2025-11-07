@@ -1,8 +1,8 @@
 #pragma once
 #include <format>
 #include <vector>
-
-#include "parser/Nodes.h"
+#include <optional>
+#include "errors/ErrorManager.h"
 
 
 class Namespace;
@@ -47,7 +47,11 @@ struct Type {
     virtual bool         isIntegral()      { return false; }
     virtual bool         isFloatingPoint() { return false; }
     virtual bool         isUnsigned()      { return false; }
+    virtual bool         isPointerType()   { return false; }
 
+    virtual std::optional<ErrCode> canImplicitlyConvertTo(Type* to) {
+        return ErrCode::INCOMPATIBLE_TYPES;
+    }
 
     virtual unsigned int getBitWidth() {
         throw std::runtime_error("Error: getBitWidth unimplemented!");
@@ -62,12 +66,55 @@ struct Type {
 
     /// Returns the wrapped-type, only valid for types which wrap another, e.g. Array, Reference, Slice etc.
     [[nodiscard]] virtual Type* getWrappedType() {
-        throw std::runtime_error("`getWrappedType` called on a non-wrapper type!");
+        return nullptr;
     }
 
+    /// Returns the wrapped-type if the type is a wrapper-type, otherwise returns the instance pointer.
+    [[nodiscard]] virtual Type* getWrappedTypeOrInstance() {
+        if (const auto ret = getWrappedType())
+            return ret;
+        return this;
+    }
+
+    [[nodiscard]]
+    virtual FunctionType* getBuiltinMethodSignature(std::string_view name) {
+        return nullptr;
+    }
+
+    virtual bool isReferenceLikeType() { return getTypeTag() == REFERENCE || getTypeTag() == POINTER; }
     virtual bool operator==(Type* other) { return getTypeTag() == other->getTypeTag(); }
 
     virtual ~Type() = default;
+};
+
+
+struct IntegralType : Type {
+    bool isIntegral() override {
+        return true;
+    }
+
+    std::optional<ErrCode> canImplicitlyConvertTo(Type* to) override {
+        if (!to->isIntegral())
+            return ErrCode::INCOMPATIBLE_TYPES;
+        if (to->isUnsigned() != isUnsigned())
+            return ErrCode::NO_SIGNED_UNSIGNED_CONV;
+        if (to->getBitWidth() < getBitWidth()) {
+            return ErrCode::NO_NARROWING_CONVERSION;
+        } return std::nullopt;
+    }
+};
+
+
+struct FloatingPointType : Type {
+    bool isFloatingPoint() override {
+        return true;
+    }
+
+    std::optional<ErrCode> canImplicitlyConvertTo(Type* to) override {
+        if (to->getBitWidth() < getBitWidth()) {
+            return ErrCode::NO_NARROWING_CONVERSION;
+        } return std::nullopt;
+    }
 };
 
 
@@ -90,7 +137,7 @@ struct FunctionType final : Type {
 
 
 struct StructType final : Type {
-    IdentInfo* ident;
+    IdentInfo* ident = nullptr;
 
     std::vector<Type*> field_types;
     std::unordered_map<std::string, std::size_t> field_offsets;
@@ -98,7 +145,7 @@ struct StructType final : Type {
     SwTypes getTypeTag() override { return STRUCT; }
 
     [[nodiscard]] std::string toString() const override;
-    [[nodiscard]] IdentInfo* getIdent() const override { return ident; }
+    [[nodiscard]] IdentInfo*  getIdent() const override { return ident; }
 
     bool operator==(Type* other) override {
         return other->getTypeTag() == STRUCT && (field_types == dynamic_cast<StructType*>(other)->field_types);
@@ -151,17 +198,16 @@ struct TypeChar final : Type {
 
 
 struct TypeStr final : Type {
-    std::size_t size;
-
-    explicit TypeStr(const std::size_t len): size(len) {}
-
     SwTypes getTypeTag() override { return STR; }
-    Type* getWrappedType() override;
+
+    explicit TypeStr(const bool is_mutable = false) {
+        this->is_mutable = is_mutable;
+    }
 
     [[nodiscard]] std::string toString() const override { return "str"; }
 
     std::size_t getAggregateSize() override {
-        return size;
+        return 8 * 2;  // in bytes
     }
 
     llvm::Type* llvmCodegen(LLVMBackend& instance) override;
@@ -193,10 +239,12 @@ struct ReferenceType final : Type {
 
 struct PointerType final : Type {
     Type*    of_type = nullptr;
-    uint16_t pointer_level{};
+    bool     is_mutable = false;
 
     PointerType() = default;
-    explicit PointerType(Type* t, const uint16_t level): of_type(t), pointer_level(level) {}
+    explicit PointerType(Type* t, const bool mutability): of_type(t), is_mutable(mutability) {}
+
+    bool isPointerType() override { return true; }
 
     [[nodiscard]] std::string toString() const override;
     [[nodiscard]] IdentInfo* getIdent() const override { return nullptr; }
@@ -233,7 +281,7 @@ struct VoidType final : Type {
 };
 
 
-struct TypeI8 : Type {
+struct TypeI8 : IntegralType {
     [[nodiscard]] std::string toString() const override { return "i8"; }
     [[nodiscard]] IdentInfo* getIdent() const override { return nullptr; }
     SwTypes getTypeTag() override { return I8; }
@@ -244,7 +292,7 @@ struct TypeI8 : Type {
     llvm::Type* llvmCodegen(LLVMBackend& instance) override;
 };
 
-struct TypeI16 : Type {
+struct TypeI16 : IntegralType {
     [[nodiscard]] std::string toString() const override { return "i16"; }
     [[nodiscard]] IdentInfo* getIdent() const override { return nullptr; }
     SwTypes getTypeTag() override { return I16; }
@@ -255,7 +303,7 @@ struct TypeI16 : Type {
     llvm::Type* llvmCodegen(LLVMBackend& instance) override;
 };
 
-struct TypeI32 : Type {
+struct TypeI32 : IntegralType {
     [[nodiscard]] std::string toString() const override { return "i32"; }
     [[nodiscard]] IdentInfo* getIdent() const override { return nullptr; }
     SwTypes getTypeTag() override { return I32; }
@@ -266,7 +314,7 @@ struct TypeI32 : Type {
     llvm::Type* llvmCodegen(LLVMBackend& instance) override;
 };
 
-struct TypeI64 : Type {
+struct TypeI64 : IntegralType {
     [[nodiscard]] std::string toString() const override { return "i64"; }
     [[nodiscard]] IdentInfo* getIdent() const override { return nullptr; }
     SwTypes getTypeTag() override { return I64; }
@@ -277,7 +325,7 @@ struct TypeI64 : Type {
     llvm::Type* llvmCodegen(LLVMBackend& instance) override;
 };
 
-struct TypeI128 : Type {
+struct TypeI128 : IntegralType {
     [[nodiscard]] std::string toString() const override { return "i128"; }
     [[nodiscard]] IdentInfo* getIdent() const override { return nullptr; }
     SwTypes getTypeTag() override { return I128; }
@@ -319,7 +367,7 @@ struct TypeU128 final : TypeI128 {
     bool isUnsigned() override { return true; }
 };
 
-struct TypeF32 final : Type {
+struct TypeF32 final : FloatingPointType {
     [[nodiscard]] std::string toString() const override { return "f32"; }
     [[nodiscard]] IdentInfo* getIdent() const override { return nullptr; }
     SwTypes getTypeTag() override { return F32; }
@@ -330,7 +378,7 @@ struct TypeF32 final : Type {
     llvm::Type* llvmCodegen(LLVMBackend& instance) override;
 };
 
-struct TypeF64 final : Type {
+struct TypeF64 final : FloatingPointType {
     [[nodiscard]] std::string toString() const override { return "f64"; }
     [[nodiscard]] IdentInfo* getIdent() const override { return nullptr; }
     SwTypes getTypeTag() override { return F64; }
