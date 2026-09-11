@@ -1,0 +1,59 @@
+#pragma once
+#include <utility>
+
+#include "SymbolRegistrationPass.h"
+#include "SymbolResolver.h"
+#include "TypeResolver.h"
+
+
+#define SW_SEMA_PIPELINE \
+    SW_SEMA_PASS(SymbolRegistrationPass) \
+    SW_SEMA_PASS(SymbolResolver, SymbolResolver::Data{}) \
+    SW_SEMA_PASS(TypeResolver)
+
+
+namespace sema {
+class Sema {
+public:
+    Sema(Module* module, ErrorCallback_t error_callback, const bool is_mono = false)
+        : m_Module(module)
+        , m_ErrorCallback(std::move(error_callback))
+        , m_IsMonomorphization(is_mono) {}
+
+
+    /// Performs sema on the entire module.
+    void start() {
+    #define SW_SEMA_PASS(x, ...) \
+        x x ## _inst{{m_Module, m_ErrorCallback, false, m_Module->getTarget()}}; \
+        x ## _inst.dispatch(m_Module->ast __VA_OPT__(,) __VA_ARGS__); \
+        if (x ## _inst.errorsOccurred()) { m_ErrorsOccurred = true; return; }
+        SW_SEMA_PIPELINE
+    #undef SW_SEMA_PASS
+    }
+
+
+    /// Performs sema on the particular node.
+    void start(Node* node, bool is_monomorphization = false) {
+    #define SW_SEMA_PASS(x, ...) \
+        x x ## _inst{{m_Module, m_ErrorCallback, is_monomorphization, m_Module->getTarget()}}; \
+        x ## _inst.dispatch(node __VA_OPT__(,) __VA_ARGS__); \
+        if (x ## _inst.errorsOccurred()) { m_ErrorsOccurred = true; return; }
+        SW_SEMA_PIPELINE
+    #undef SW_SEMA_PASS
+    }
+
+
+    [[nodiscard]]
+    bool errorsOccurred() const {
+        return m_ErrorsOccurred;
+    }
+
+
+private:
+    Module* m_Module;
+    ErrorCallback_t m_ErrorCallback;
+
+    bool m_ErrorsOccurred = false;
+    bool m_IsMonomorphization = false;
+};
+}

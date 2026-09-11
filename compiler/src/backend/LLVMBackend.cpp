@@ -1,46 +1,74 @@
-#include <cassert>
-#include <string>
-#include <unordered_map>
-
-#include "CompilerInst.h"
-#include "types/SwTypes.h"
 #include "backend/LLVMBackend.h"
+#include "CompilerInst.h"
+#include "modules/ModuleManager.h"
 #include "parser/Parser.h"
+#include "types/SwTypes.h"
 
+#include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
-#include <llvm/IR/Function.h>
-#include <llvm/IR/Type.h>
-#include <llvm/IR/DataLayout.h>
-#include <llvm/IR/GlobalVariable.h>
-#include <llvm/IR/DerivedTypes.h>
-#include <llvm/IR/GlobalValue.h>
-#include <llvm/IR/Instructions.h>
-#include <llvm/IR/BasicBlock.h>
-#include <llvm/IR/Constants.h>
-#include <llvm/Support/FileSystem.h>
-#include <llvm/Support/Casting.h>
-#include <llvm/Transforms/Utils/BasicBlockUtils.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Support/CodeGen.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Target/TargetOptions.h>
 
 
-#define PRE_SETUP() LLVMBackend::SetupHandler GET_UNIQUE_NAME(backend_helper_){instance, this};
-#define SET_BOUND_TYPE_STATE(x) LLVMBackend::BoundTypeStateHelper GET_UNIQUE_NAME(bound_ty)(instance, x);
+/// Creates and returns a CGValue out of n lvalue
+CGValue CGValue::lValue(llvm::Value* lvalue, Type* source_ty) {
+    return {lvalue, nullptr, source_ty};
+}
 
-// ReSharper disable all CppUseStructuredBinding
+/// Creates and returns a CGValue out of a rvalue
+CGValue CGValue::rValue(llvm::Value* rvalue, Type* source_ty) {
+    return {nullptr, rvalue, source_ty};
+}
+
+/// Returns the held lvalue
+llvm::Value* CGValue::getLValue() const {
+    if (!m_LValue) {
+        assert(m_RValue);
+        assert(m_RValue->getType()->isPointerTy());
+        return m_RValue;
+    } return m_LValue;
+}
+
+bool CGValue::isLValue() const {
+    if (m_LValue || (m_RValue && m_RValue->getType()->isPointerTy())) {
+        return true;
+    } return false;
+}
 
 
-LLVMBackend::LLVMBackend(Parser& parser)
-    : ModuleManager(parser.m_ModuleMap),
-      LModule{
+/// If there's no held rvalue, creates and returns a load of the held lvalue, returns the held
+/// rvalue otherwise.
+llvm::Value* CGValue::getRValue(LLVMBackend& instance, const SwContext& context) const {
+    if (!m_RValue) {
+        assert(m_LValue);
+        assert(m_SourceTy);
+        return instance.castIfNecessary(
+            m_SourceTy,
+            instance.Builder.CreateLoad(
+                instance.codegen(m_SourceTy, context), m_LValue),
+                context);
+
+    } return instance.castIfNecessary(
+        m_SourceTy ? m_SourceTy : &GlobalUniversalType,
+        m_RValue,
+        context);
+}
+
+
+LLVMBackend::LLVMBackend(Module* module)
+    : ModuleManager(module->getModuleManager())
+    , SymMan(module->symbol_table)
+    , SwModule(module)
+    , TypeManager(module->type_manager)
+    , LModule{
         std::make_unique<llvm::Module>(
-            ModuleManager.getModuleUID(parser.m_FilePath),
-            Context)
-    }
-    , AST(std::move(parser.AST))
-    , SymMan(parser.SymbolTable)
+        ModuleManager.getModuleUID(module->file_handle->getPath()),
+        LLVMContext)
+      }
 {
-    m_LatestBoundType.emplace(nullptr);
-    m_ManglingContexts.emplace();
-
     static std::once_flag once_flag;
     std::call_once(once_flag, []{
         llvm::InitializeNativeTarget();
@@ -49,7 +77,8 @@ LLVMBackend::LLVMBackend(Parser& parser)
     });
 
     std::string error;
-    const auto target = llvm::TargetRegistry::lookupTarget(CompilerInst::TargetTriple, error);
+    const auto target = llvm::TargetRegistry::lookupTarget(
+        llvm::Triple(CompilerInst::Target.getTriple().toString()), error);
 
     if (!target) {
         throw std::runtime_error("Failed to lookup target! " + error);
@@ -61,56 +90,35 @@ LLVMBackend::LLVMBackend(Parser& parser)
     static std::once_flag _;
     std::call_once(_, [&] {
         TargetMachine = target->createTargetMachine(
-            CompilerInst::TargetTriple, "generic", "", options, reloc_model
+            llvm::Triple(CompilerInst::Target.getTriple().toString()), "generic", "", options, reloc_model
         );
     });
 
+    assert(TargetMachine);
     LModule->setDataLayout(TargetMachine->createDataLayout());
-    LModule->setTargetTriple(llvm::Triple(CompilerInst::TargetTriple).getTriple());
+    LModule->setTargetTriple(llvm::Triple(CompilerInst::Target.getTriple().toString()));
 }
 
 
-/// Creates and returns a CGValue out of an lvalue
-CGValue CGValue::lValue(llvm::Value* lvalue) {
-    return {lvalue, nullptr};
-}
-
-/// Creates and returns a CGValue out of an rvalue
-CGValue CGValue::rValue(llvm::Value* rvalue) {
-    return {nullptr, rvalue};
-}
-
-/// Returns the held lvalue
-llvm::Value* CGValue::getLValue() {
-    if (!m_LValue) {
-        assert(m_RValue);
-        assert(m_RValue->getType()->isPointerTy());
-        return m_RValue;
-    } return m_LValue;
-}
-
-/// If there's no held rvalue, creates and returns a load of the held lvalue, returns the held
-/// rvalue otherwise.
-llvm::Value* CGValue::getRValue(LLVMBackend& instance) {
-    if (!m_RValue) {
-        assert(m_LValue);
-        return instance.Builder.CreateLoad(instance.getBoundLLVMType(), m_LValue);
-    } return m_RValue;
-}
-
-
-std::string LLVMBackend::mangleString(IdentInfo* id) {
+std::string LLVMBackend::mangleString(IdentInfo* id, const ManglingContext& ctx) const {
     auto decl_lookup = SymMan.lookupDecl(id);
 
-    if (decl_lookup.node_ptr) {
-        // do not mangle `extern "C"` symbols
-        if (decl_lookup.node_ptr->isGlobal()) {
-            if (dynamic_cast<GlobalNode*>(
-                decl_lookup.node_ptr
-                )->extern_attributes.contains("C")) {
+    if (auto node = decl_lookup.node_ptr) {
+        // do not mangle `extern "C"` symbols or the "main" function
+        if (node->isGlobal()) {
+            const bool non_mangling_condition =
+                node->to<GlobalNode>()->extern_attributes.contains("C") ||
+                node->getNodeType() == ND_FUNC && !decl_lookup.method_of && id->toString() == "main";
+
+            if (non_mangling_condition) {
                 return id->toString();
             }
         }
+    }
+
+    std::string ret = "__Sw_" + ModuleManager.getModuleUID(id->getModuleFileHandle()->getPath()) + "_";
+    for (auto& arg : ctx.generic_args) {
+        ret.append(arg->toString());
     }
 
     if (decl_lookup.method_of) {
@@ -118,17 +126,75 @@ std::string LLVMBackend::mangleString(IdentInfo* id) {
         assert(type != nullptr);
 
         // unwrap the type if needed
-        if (type->getTypeTag() == Type::REFERENCE)
-            type = dynamic_cast<ReferenceType*>(type)->of_type;
-        assert(type->getTypeTag() != Type::POINTER);
+        if (type->isReferenceType())
+            type = type->to<ReferenceType>()->of_type;
+        assert(!type->isPointerType());
 
-        return "__Sw_" + type->toString() +
-            '_' + ModuleManager.getModuleUID(id->getModulePath()) + "_" + id->toString();
-    } return "__Sw_" + ModuleManager.getModuleUID(id->getModulePath()) + '_' + id->toString();
+        std::string mangle = type->toString() + '_' + ret;
+
+        // protocol-impl methods: include the protocol so that same-named methods
+        // of distinct impls on the same type do not collide
+        if (decl_lookup.protocol_of) {
+            mangle += std::string(decl_lookup.protocol_of->toString()) + '_' +
+                      ModuleManager.getModuleUID(decl_lookup.protocol_of->getModuleFileHandle()->getPath()) + '_';
+        }
+
+        return mangle + id->toString();
+    } return ret + id->toString();
 }
 
 
-void LLVMBackend::codegenChildrenUntilRet(NodesVec& children, llvm::Value* condition) {
+llvm::Value* LLVMBackend::castIfNecessary(Type* source_type, llvm::Value* subject, const SwContext& context) {
+    if (source_type == &GlobalUniversalType || !context.bound_type) {
+        return subject;
+    }
+
+    // perform implicit-dereferencing, if applicable
+    if (source_type->isReferenceType()) {
+        auto referenced_type = source_type->to<ReferenceType>()->of_type;
+        if (!context.bound_type->isReferenceLikeType()) {
+            subject = Builder.CreateLoad(
+                codegen(referenced_type, context),
+                subject, "implicit_deref"
+            );
+        } source_type = referenced_type;
+    }
+
+    if (source_type->isPointerType() && context.bound_type->isIntegral()) {
+        return Builder.CreatePtrToInt(subject, codegen(context.bound_type, context));
+    }
+
+    if (source_type->isIntegral() && context.bound_type->isPointerType()) {
+        return Builder.CreateIntToPtr(subject, codegen(context.bound_type, context));
+    }
+
+    if (context.bound_type != source_type && !source_type->isStructType()) {
+        if (context.bound_type->isIntegral() || context.bound_type->isBoolean()) {
+            // if the destination type is unsigned or if the source type is boolean
+            // perform a zero-extension or truncation
+            if (source_type->isIntegral()) {
+                if (source_type->isUnsigned() || source_type->isBoolean()) {
+                    return Builder.CreateZExtOrTrunc(subject, codegen(context.bound_type, context));
+                } return Builder.CreateSExtOrTrunc(subject, codegen(context.bound_type, context));
+            }
+        }
+
+        if (context.bound_type->isFloatingPoint()) {
+            if (source_type->isFloatingPoint()) {
+                return Builder.CreateFPCast(subject, codegen(context.bound_type, context));
+            }
+
+            if (source_type->isIntegral()) {
+                if (source_type->isUnsigned()) {
+                    return Builder.CreateUIToFP(subject, codegen(context.bound_type, context));
+                } return Builder.CreateSIToFP(subject, codegen(context.bound_type, context));
+            }
+        }
+    } return subject;
+}
+
+
+void LLVMBackend::codegenChildrenUntilRet(const std::span<Node*> children, const SwContext& context, llvm::Value* condition) {
     if (condition) {
         if (llvm::isa<llvm::ConstantInt>(condition)) {
             auto v = llvm::cast<llvm::ConstantInt>(condition);
@@ -143,90 +209,906 @@ void LLVMBackend::codegenChildrenUntilRet(NodesVec& children, llvm::Value* condi
             case ND_BREAK:
             case ND_CONTINUE:
             case ND_RET:
-                child->llvmCodegen(*this);
+                codegen(child, context);
                 return;
             case ND_INVALID:
                 continue;
             default:
-                child->llvmCodegen(*this);
+                codegen(child, context);
         }
     }
 }
 
 
-CGValue IntLit::llvmCodegen(LLVMBackend& instance) {
-    PRE_SETUP();
+void LLVMBackend::codegenChildrenUntilRet(const Scope* children, const SwContext& context, llvm::Value* condition) {
+    if (children) {
+        codegenChildrenUntilRet(children->children, context, condition);
+    }
+}
+
+
+CGValue LLVMBackend::llvmCodegen(Expression* node, SwContext context) {
+    assert(node->expr_type != nullptr);
+    context.bound_type = node->expr_type;
+    const auto val = codegen(node->expr, context);
+    return val;
+}
+
+
+CGValue LLVMBackend::llvmCodegen(const IntLit* node, const SwContext& context) {
     llvm::Value* ret = nullptr;
 
-    if (instance.getBoundTypeState()->isIntegral()) {
-        auto int_type = llvm::dyn_cast<llvm::IntegerType>(instance.getBoundLLVMType());
+    assert(context.bound_type);
+    if (context.bound_type->isIntegral()) {
+        auto int_type = llvm::dyn_cast<llvm::IntegerType>(codegen(context.bound_type, context));
         assert(int_type);
 
-        if (value.starts_with("0x"))
-            ret = llvm::ConstantInt::get(int_type, value.substr(2), 16);
-        else if (value.starts_with("0o"))
-            ret = llvm::ConstantInt::get(int_type, value.substr(2), 8);
-        else if (value.starts_with("0b"))
-            ret = llvm::ConstantInt::get(int_type, value.substr(2), 2);
-        else ret = llvm::ConstantInt::get(int_type, value, 10);
+        if (node->value.starts_with("0x"))
+            ret = llvm::ConstantInt::get(int_type, node->value.substr(2), 16);
+        else if (node->value.starts_with("0o"))
+            ret = llvm::ConstantInt::get(int_type, node->value.substr(2), 8);
+        else if (node->value.starts_with("0b"))
+            ret = llvm::ConstantInt::get(int_type, node->value.substr(2), 2);
+        else ret = llvm::ConstantInt::get(int_type, node->value, 10);
     }
 
-    else if (instance.getBoundTypeState()->isFloatingPoint()) {
-        ret = llvm::ConstantFP::get(instance.getBoundLLVMType(), value);
-    } else if (instance.getBoundTypeState()->getTypeTag() == Type::BOOL) {
-        ret = llvm::ConstantInt::get(llvm::Type::getInt32Ty(instance.Context), std::to_string(toInteger(value)), 10);
+    else if (context.bound_type->isFloatingPoint()) {
+        ret = llvm::ConstantFP::get(codegen(context.bound_type, context), node->value);
+    } else if (context.bound_type->isBoolean()) {
+        ret = llvm::ConstantInt::get(
+            llvm::Type::getInt32Ty(LLVMContext), std::to_string(toInteger(std::string(node->value))), 10);
     }
 
     else {
         throw std::runtime_error(std::format("Fatal: IntLit::llvmCodegen called but instance is neither in "
-                                "integral nor FP state. State: `{}`", instance.getBoundTypeState()->toString()));
+                                             "integral nor FP state. State: `{}`", context.bound_type->toString()));
     }
-    return CGValue::rValue(ret);
+    return CGValue::rValue(ret, context.bound_type);
 }
 
-CGValue FloatLit::llvmCodegen(LLVMBackend& instance) {
-    PRE_SETUP();
-    return CGValue::rValue(llvm::ConstantFP::get(instance.getBoundLLVMType(), value));
+
+CGValue LLVMBackend::llvmCodegen(const FloatLit* node, const SwContext& context) {
+    return CGValue::rValue(
+        llvm::ConstantFP::get(codegen(context.bound_type, context), node->value),
+        context.bound_type);
 }
 
-CGValue StrLit::llvmCodegen(LLVMBackend& instance) {
-    PRE_SETUP();
-    auto ptr = instance.Builder.CreateGlobalString(
-        value, "", 0, instance.getLLVMModule(), false);
+
+CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
+    assert(node->common_type);
+    context.bound_type = node->common_type;
+
+    static const Type* str_type = TypeManager.lookupType(SymMan.getIdInfoOfAGlobal("str"));
+
+
+    switch (node->op_type) {
+        case Op::UNARY_ADD:
+            return codegen(node->operands.back(), context);
+
+        case Op::UNARY_SUB:
+            return CGValue::rValue(
+                Builder.CreateNeg(codegen(node->operands.back(), context).getRValue(*this, context)),
+                context.bound_type);
+
+        case Op::BINARY_ADD: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            if (context.bound_type->isIntegral()) {
+                return CGValue::rValue(Builder.CreateAdd(lhs, rhs), context.bound_type);
+            }
+
+            assert(lhs->getType()->isFloatingPointTy() && rhs->getType()->isFloatingPointTy());
+            return CGValue::rValue(Builder.CreateFAdd(lhs, rhs), context.bound_type);
+        }
+
+        case Op::BINARY_SUB: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            if (context.bound_type->isIntegral()) {
+                return CGValue::rValue(Builder.CreateSub(lhs, rhs), context.bound_type);
+            }
+            return CGValue::rValue(Builder.CreateFSub(lhs, rhs), context.bound_type);
+        }
+
+        case Op::MUL: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            if (context.bound_type->isIntegral()) {
+                return CGValue::rValue(Builder.CreateMul(lhs, rhs), context.bound_type);
+            }
+
+            return CGValue::rValue(Builder.CreateFMul(lhs, rhs), context.bound_type);
+        }
+
+        case Op::DEREFERENCE: {
+            // preserve the l-value of the operand
+            auto operand = codegen(node->getLHS(), context);
+            return CGValue::lValue(operand.getRValue(*this, context), context.bound_type);
+        }
+
+        case Op::ADDRESS_TAKING: {
+            auto operand = node->getLHS()->getWrappedNodeOrInstance();
+            Type* type = fetchSwType(operand);
+
+            // handle slice-creation for array types
+            if (type->isArrayType() && !node->common_type->isPointerType()) {
+                auto slice_type = TypeManager.getSliceType(type->getWrappedType(), node->is_mutable);
+
+                auto slice_llvm_ty = codegen(slice_type, context);
+
+                auto slice_instance = Builder.CreateAlloca(slice_llvm_ty);
+                auto ptr_field = Builder.CreateStructGEP(
+                    slice_llvm_ty,
+                    slice_instance,
+                    0
+                );
+
+                auto size_field = Builder.CreateStructGEP(
+                    slice_llvm_ty,
+                    slice_instance,
+                    1
+                );
+
+                auto arr_instance_ptr = codegen(operand, context);
+
+                // calculate the pointer to the array
+                auto element_ptr = Builder.CreateStructGEP(
+                    codegen(type, context),
+                    arr_instance_ptr.getLValue(),
+                    0
+                );
+
+                Builder.CreateStore(element_ptr, ptr_field);
+                Builder.CreateStore(
+                    toLLVMInt(type->getAggregateSize()),
+                    size_field
+                );
+
+                // if the address of the array is requested instead
+                if (context.cast_to && context.cast_to->isPointerType()) {
+                    auto pointer = Builder.CreateStructGEP(
+                        codegen(type, context),
+                        arr_instance_ptr.getLValue(),
+                        0);
+                    return CGValue::rValue(pointer, context.bound_type);
+                }
+
+                return CGValue::rValue(llvm::dyn_cast<llvm::Value>(slice_instance), context.bound_type);
+            }
+
+            if (operand->getNodeType() == ND_IDENT) {
+                auto& tab_entry = SymMan.lookupDecl(operand->getIdentInfo());
+                auto op_address = tab_entry.llvm_value;
+                assert(op_address->getType()->isPointerTy());
+
+                RefMemory = op_address;
+
+                return CGValue{op_address, op_address, context.bound_type};
+
+            } throw;
+        }
+
+        case Op::DIV: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            if (context.bound_type->isFloatingPoint()) {
+                return CGValue::rValue(Builder.CreateFDiv(lhs, rhs), context.bound_type);
+            }
+            if (context.bound_type->isUnsigned()) {
+                return CGValue::rValue(Builder.CreateUDiv(lhs, rhs), context.bound_type);
+            }
+
+            return CGValue::rValue(Builder.CreateSDiv(lhs, rhs), context.bound_type);
+        }
+
+        case Op::MOD: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            // SemanticAnalysis ascertains that integral types are used
+            if (context.bound_type->isUnsigned()) {
+                return CGValue::rValue(Builder.CreateURem(lhs, rhs), context.bound_type);
+            }
+
+            return CGValue::rValue(Builder.CreateSRem(lhs, rhs), context.bound_type);
+        }
+
+        case Op::CAST_OP: {
+            assert(node->operands.at(1)->getNodeType() == ND_TYPE);
+            context.bound_type = node->operands.at(1)->getSwType();
+            context.cast_to = context.bound_type;
+
+            return CGValue::rValue(
+                codegen(node->getLHS(), context).getRValue(*this, context),
+                context.bound_type);
+        }
+
+        case Op::LOGICAL_EQUAL: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            assert(lhs->getType() == rhs->getType());
+
+            if (lhs->getType()->isFloatingPointTy()) {
+                return CGValue::rValue(Builder.CreateFCmpOEQ(lhs, rhs), context.bound_type);
+            }
+
+            if (lhs->getType()->isIntegerTy()) {
+                return CGValue::rValue(Builder.CreateICmpEQ(lhs, rhs), context.bound_type);
+            }
+            throw;
+        }
+
+        case Op::LOGICAL_NOTEQUAL: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            assert(lhs->getType() == rhs->getType());
+
+            if (lhs->getType()->isFloatingPointTy()) {
+                return CGValue::rValue(Builder.CreateFCmpONE(lhs, rhs), context.bound_type);
+            }
+
+            if (lhs->getType()->isIntegerTy()) {
+                return CGValue::rValue(Builder.CreateICmpNE(lhs, rhs), context.bound_type);
+            }
+            throw;
+        }
+
+        case Op::LOGICAL_AND: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            return CGValue::rValue(Builder.CreateLogicalAnd(lhs, rhs), context.bound_type);
+        }
+
+        case Op::LOGICAL_NOT: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            return CGValue::rValue(Builder.CreateNot(lhs), context.bound_type);
+        }
+
+        case Op::LOGICAL_OR: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            return CGValue::rValue(Builder.CreateLogicalOr(lhs, rhs), context.bound_type);
+        }
+
+        case Op::GREATER_THAN: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            auto lhs_type = fetchSwType(node->operands.at(0));
+            auto rhs_type = fetchSwType(node->operands.at(1));
+
+            assert(lhs->getType() == rhs->getType());
+
+            if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
+                return CGValue::rValue(Builder.CreateFCmpOGT(lhs, rhs), context.bound_type);
+            }
+
+            if (lhs_type->isUnsigned() && rhs_type->isUnsigned()) {
+                return CGValue::rValue(Builder.CreateICmpUGT(lhs, rhs), context.bound_type);
+            }
+
+            return CGValue::rValue(Builder.CreateICmpSGT(lhs, rhs), context.bound_type);
+        }
+
+        case Op::GREATER_THAN_OR_EQUAL: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            auto lhs_type = fetchSwType(node->operands.at(0));
+            auto rhs_type = fetchSwType(node->operands.at(1));
+
+            assert(lhs->getType() == rhs->getType());
+
+            if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
+                return CGValue::rValue(Builder.CreateFCmpOGE(lhs, rhs), context.bound_type);
+            }
+
+            if (lhs_type->isUnsigned() && rhs_type->isUnsigned()) {
+                return CGValue::rValue(Builder.CreateICmpUGE(lhs, rhs), context.bound_type);
+            }
+
+            return CGValue::rValue(Builder.CreateICmpSGE(lhs, rhs), context.bound_type);
+        }
+
+        case Op::LESS_THAN: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            auto lhs_type = fetchSwType(node->operands.at(0));
+            auto rhs_type = fetchSwType(node->operands.at(1));
+
+            assert(lhs->getType() == rhs->getType());
+
+            if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
+                return CGValue::rValue(Builder.CreateFCmpOLT(lhs, rhs), context.bound_type);
+            }
+
+            if (lhs_type->isUnsigned() && rhs_type->isUnsigned()) {
+                return CGValue::rValue(Builder.CreateICmpULT(lhs, rhs), context.bound_type);
+            }
+
+            return CGValue::rValue(Builder.CreateICmpSLT(lhs, rhs), context.bound_type);
+        }
+
+        case Op::LESS_THAN_OR_EQUAL: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            auto lhs_type = fetchSwType(node->operands.at(0));
+            auto rhs_type = fetchSwType(node->operands.at(1));
+
+            assert(lhs->getType() == rhs->getType());
+
+            if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
+                return CGValue::rValue(Builder.CreateFCmpOLE(lhs, rhs), context.bound_type);
+            }
+
+            if (lhs_type->isUnsigned() && rhs_type->isUnsigned()) {
+                return CGValue::rValue(Builder.CreateICmpULE(lhs, rhs), context.bound_type);
+            }
+
+            return CGValue::rValue(Builder.CreateICmpSLE(lhs, rhs), context.bound_type);
+        }
+
+        case Op::ASSIGNMENT: {
+            auto lhs = codegen(node->getLHS(), context).getLValue();
+            context.bound_type = node->common_type;
+            auto rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+
+            assert(lhs->getType()->isPointerTy());
+            Builder.CreateStore(rhs, lhs);
+            return {};
+        }
+
+        // (this case is quite unreadable, but only until operator overloading is implemented)
+        case Op::INDEXING_OP: {
+            auto operand_llvm_ty = codegen(fetchSwType(node->operands.at(0)), context);
+
+            // pointer indexing
+            if (operand_llvm_ty->isPointerTy()) {
+                auto ptr_val = codegen(node->getLHS(), context).getRValue(*this, context);
+                context.bound_type = fetchSwType(node->operands.at(1));
+
+                llvm::Value* idx = codegen(node->getRHS(), context).getRValue(*this, context);
+
+                auto container_sw_type = fetchSwType(node->operands.at(0));
+                auto elem_sw_type = container_sw_type->getWrappedType();
+                auto elem_llvm_ty = codegen(elem_sw_type, context);
+                auto element_ptr = Builder.CreateGEP(elem_llvm_ty, ptr_val, idx);
+
+                ComputedPtr = element_ptr;
+                return {element_ptr, Builder.CreateLoad(elem_llvm_ty, element_ptr), elem_sw_type};
+            }
+
+            llvm::Value* lhs_lvalue;
+            if (auto cg = codegen(node->getLHS(), context); !cg.isLValue()) {
+                // allocate the parameter on the stack and store the argument
+                lhs_lvalue = Builder.CreateAlloca(operand_llvm_ty);
+                Builder.CreateStore(cg.getRValue(*this, context), lhs_lvalue);
+            } else {
+                // load the lvalue directly
+                lhs_lvalue = codegen(node->getLHS(), context).getLValue();
+            }
+
+            auto arr_or_ptr_ptr = Builder.CreateStructGEP(
+                operand_llvm_ty, lhs_lvalue, 0);
+
+            context.bound_type = fetchSwType(node->operands.at(1));
+            llvm::Value* second_op = codegen(node->operands.at(1), context).getRValue(*this, context);
+            llvm::Value* element_ptr;
+
+            auto container_sw_type = fetchSwType(node->operands.at(0));
+            auto elem_sw_type = container_sw_type == str_type ?
+                static_cast<Type*>(&GlobalTypeI8) :
+                container_sw_type->getWrappedType();
+            auto elem_llvm_ty = codegen(elem_sw_type, context);
+
+            if (auto arr_ty = llvm::dyn_cast<llvm::ArrayType>(
+                operand_llvm_ty->getStructElementType(0)))
+            {
+                // { [T | N] } GEP through the array
+                element_ptr = Builder.CreateGEP(
+                    arr_ty, arr_or_ptr_ptr, {toLLVMInt(0), second_op});
+            }
+
+            else {
+                auto data_ptr = Builder.CreateLoad(
+                    operand_llvm_ty->getStructElementType(0), arr_or_ptr_ptr);
+                element_ptr = Builder.CreateGEP(
+                    elem_llvm_ty, data_ptr, second_op);
+            }
+
+
+            assert(element_ptr != nullptr);
+            ComputedPtr = element_ptr;
+
+            return {element_ptr, Builder.CreateLoad(elem_llvm_ty, element_ptr), context.bound_type};
+        }
+        case Op::BITWISE_OR: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+            return CGValue::rValue(Builder.CreateOr(lhs, rhs), context.bound_type);
+        }
+
+        case Op::BITWISE_AND: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+            return CGValue::rValue(Builder.CreateAnd(lhs, rhs), context.bound_type);
+        }
+
+        case Op::BITWISE_XOR: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+            return CGValue::rValue(Builder.CreateXor(lhs, rhs), context.bound_type);
+        }
+
+        case Op::BITWISE_NOT: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            return CGValue::rValue(Builder.CreateNot(lhs), context.bound_type);
+        }
+
+        case Op::EXP: {
+            auto* base = codegen(node->getLHS(), context).getRValue(*this, context);
+
+            context.bound_type = fetchSwType(node->operands.at(1));
+            auto* exp = codegen(node->getRHS(), context).getRValue(*this, context);
+            auto* parent = Builder.GetInsertBlock()->getParent();
+            auto* llvm_ty = base->getType();
+            auto* entry = Builder.GetInsertBlock();
+
+            auto is_fp = llvm_ty->isFloatingPointTy();
+            auto* one = is_fp
+                ? llvm::ConstantFP::get(llvm_ty, 1.0)
+                : llvm::ConstantInt::get(llvm_ty, 1);
+            auto* zero = llvm::ConstantInt::get(exp->getType(), 0);
+
+            auto* cond_bb = llvm::BasicBlock::Create(LLVMContext, "exp_cond", parent);
+            auto* body_bb = llvm::BasicBlock::Create(LLVMContext, "exp_body", parent);
+            auto* done_bb = llvm::BasicBlock::Create(LLVMContext, "exp_done", parent);
+
+            Builder.CreateBr(cond_bb);
+
+            Builder.SetInsertPoint(cond_bb);
+            auto* res_phi = Builder.CreatePHI(llvm_ty, 2);
+            auto* exp_phi = Builder.CreatePHI(exp->getType(), 2);
+            res_phi->addIncoming(one, entry);
+            exp_phi->addIncoming(exp, entry);
+
+            auto* gt = Builder.CreateICmpSGT(exp_phi, zero);
+            Builder.CreateCondBr(gt, body_bb, done_bb);
+
+            Builder.SetInsertPoint(body_bb);
+            auto* new_res = is_fp
+                ? Builder.CreateFMul(res_phi, base)
+                : Builder.CreateMul(res_phi, base);
+            auto* dec = Builder.CreateSub(exp_phi, llvm::ConstantInt::get(exp->getType(), 1));
+            res_phi->addIncoming(new_res, body_bb);
+            exp_phi->addIncoming(dec, body_bb);
+            Builder.CreateBr(cond_bb);
+
+            Builder.SetInsertPoint(done_bb);
+            return CGValue::rValue(res_phi, context.bound_type);
+        }
+
+        case Op::BITWISE_LSHIFT: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+            return CGValue::rValue(Builder.CreateShl(lhs, rhs), context.bound_type);
+        }
+
+        case Op::BITWISE_RSHIFT: {
+            llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
+            llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+            if (context.bound_type->isUnsigned())
+                return CGValue::rValue(Builder.CreateLShr(lhs, rhs), context.bound_type);
+            return CGValue::rValue(Builder.CreateAShr(lhs, rhs), context.bound_type);
+        }
+
+        case Op::DOT: {
+            // `(instance as Protocol).member` -- the cast is a scope-selector that sema
+            // resolves to a specific impl method; the receiver is the cast's inner operand.
+            // the LHS unwraps through any amount of expression-wrappers. the protocol cast
+            // is detected via the cast target's resolved type, which sema always sets,
+            // rather than `common_type` (left null when sema reported an error)
+            Node* receiver = node->operands.at(0);
+            auto* lhs_node = node->operands.at(0)->getWrappedNodeOrInstance();
+            if (lhs_node->getNodeType() == ND_OP) {
+                auto* lhs_op = lhs_node->to<Op>();
+                if (lhs_op->op_type == Op::CAST_OP) {
+                    auto* cast_target = lhs_op->operands.at(1)->getSwType();
+                    if (cast_target && cast_target->getTypeTag() == Type::PROTOCOL) {
+                        receiver = lhs_op->operands.at(0);
+                    }
+                }
+            }
+
+            auto operand = codegen(receiver, context);
+
+            // fetch the instance's struct-type
+            auto struct_sw_ty = fetchSwType(receiver);
+            auto struct_ty = struct_sw_ty->getWrappedTypeOrInstance()->to<StructType>();
+
+            llvm::Value* inst_ptr;
+            if (operand.isLValue()) {
+                inst_ptr = operand.getLValue();
+            } else {
+                // when the LHS isn't an LValue: materialize the value in memory from its own type
+                auto rvalue = operand.getRValue(*this, context);
+                inst_ptr = Builder.CreateAlloca(rvalue->getType());
+                Builder.CreateStore(rvalue, inst_ptr);
+            }
+
+            // in the special case when dot is using with pure-rvalues
+            // e.g., functions returning struct instances
+            if (!inst_ptr->getType()->isPointerTy()) {
+                auto tmp = Builder.CreateAlloca(inst_ptr->getType());
+                Builder.CreateStore(inst_ptr, tmp);
+                inst_ptr = tmp;
+            }
+
+            // handle the special case of methods -- lower them into regular function calls
+            if (node->operands.at(1)->getNodeType() == ND_CALL) {
+                ComputedPtr = inst_ptr;  // set ComputedPtr for the FuncCall node to grab it
+                auto ret = codegen(node->operands.at(1), context);
+                return ret;
+            }
+
+            assert(struct_ty != nullptr);
+            auto field_node = node->operands.at(1)->to<Ident>();
+            auto field_ptr = Builder.CreateStructGEP(
+                codegen(struct_ty, context),
+                inst_ptr,
+                static_cast<unsigned int>
+                (struct_ty->field_offsets.at(field_node->full_qualification.front().name.data()))
+            );
+
+            ComputedPtr = field_ptr;
+            return CGValue::lValue(field_ptr, context.bound_type);
+        }
+        case Op::ADD_ASSIGN:
+        case Op::SUB_ASSIGN:
+        case Op::MUL_ASSIGN:
+        case Op::DIV_ASSIGN:
+        case Op::MOD_ASSIGN:
+        case Op::BITWISE_OR_ASSIGN:
+        case Op::BITWISE_AND_ASSIGN:
+        case Op::BITWISE_XOR_ASSIGN:
+        case Op::BITWISE_LSHIFT_ASSIGN:
+        case Op::BITWISE_RSHIFT_ASSIGN: {
+            auto lhs_ptr = codegen(node->getLHS(), context).getLValue();
+            context.bound_type = node->common_type;
+            auto lhs = Builder.CreateLoad(codegen(context.bound_type, context), lhs_ptr);
+            auto rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+            llvm::Value* result;
+
+            switch (node->op_type) {
+                case Op::ADD_ASSIGN:
+                    if (context.bound_type->isIntegral())
+                        result = Builder.CreateAdd(lhs, rhs);
+                    else
+                        result = Builder.CreateFAdd(lhs, rhs);
+                    break;
+                case Op::SUB_ASSIGN:
+                    if (context.bound_type->isIntegral())
+                        result = Builder.CreateSub(lhs, rhs);
+                    else
+                        result = Builder.CreateFSub(lhs, rhs);
+                    break;
+                case Op::MUL_ASSIGN:
+                    if (context.bound_type->isIntegral())
+                        result = Builder.CreateMul(lhs, rhs);
+                    else
+                        result = Builder.CreateFMul(lhs, rhs);
+                    break;
+                case Op::DIV_ASSIGN:
+                    if (context.bound_type->isFloatingPoint())
+                        result = Builder.CreateFDiv(lhs, rhs);
+                    else if (context.bound_type->isUnsigned())
+                        result = Builder.CreateUDiv(lhs, rhs);
+                    else
+                        result = Builder.CreateSDiv(lhs, rhs);
+                    break;
+                case Op::MOD_ASSIGN:
+                    if (context.bound_type->isUnsigned())
+                        result = Builder.CreateURem(lhs, rhs);
+                    else
+                        result = Builder.CreateSRem(lhs, rhs);
+                    break;
+
+                case Op::BITWISE_OR_ASSIGN:
+                    result = Builder.CreateOr(lhs, rhs);
+                    break;
+                case Op::BITWISE_AND_ASSIGN:
+                    result = Builder.CreateAnd(lhs, rhs);
+                    break;
+                case Op::BITWISE_XOR_ASSIGN:
+                    result = Builder.CreateXor(lhs, rhs);
+                    break;
+                case Op::BITWISE_LSHIFT_ASSIGN:
+                    result = Builder.CreateShl(lhs, rhs);
+                    break;
+                case Op::BITWISE_RSHIFT_ASSIGN:
+                    if (context.bound_type->isUnsigned())
+                        result = Builder.CreateLShr(lhs, rhs);
+                    else
+                        result = Builder.CreateAShr(lhs, rhs);
+                    break;
+
+                default: std::unreachable();
+            }
+
+            Builder.CreateStore(result, lhs_ptr);
+            return {};
+        }
+
+        case Op::EXP_ASSIGN: {
+            auto lhs_ptr = codegen(node->getLHS(), context).getLValue();
+            context.bound_type = node->common_type;
+            auto lhs = Builder.CreateLoad(codegen(context.bound_type, context), lhs_ptr);
+
+            context.bound_type = fetchSwType(node->operands.at(1));
+            auto rhs = codegen(node->getRHS(), context).getRValue(*this, context);
+            auto* parent = Builder.GetInsertBlock()->getParent();
+            auto* entry = Builder.GetInsertBlock();
+            auto* llvm_ty = lhs->getType();
+            auto is_fp = llvm_ty->isFloatingPointTy();
+
+            auto* one = is_fp ? llvm::ConstantFP::get(llvm_ty, 1.0) : llvm::ConstantInt::get(llvm_ty, 1);
+            auto* zero = llvm::ConstantInt::get(rhs->getType(), 0);
+
+            auto* cond_bb = llvm::BasicBlock::Create(LLVMContext, "exp_cond", parent);
+            auto* body_bb = llvm::BasicBlock::Create(LLVMContext, "exp_body", parent);
+            auto* done_bb = llvm::BasicBlock::Create(LLVMContext, "exp_done", parent);
+
+            Builder.CreateBr(cond_bb);
+            Builder.SetInsertPoint(cond_bb);
+            auto* res_phi = Builder.CreatePHI(llvm_ty, 2);
+            auto* exp_phi = Builder.CreatePHI(rhs->getType(), 2);
+            res_phi->addIncoming(one, entry);
+            exp_phi->addIncoming(rhs, entry);
+
+            auto* gt = Builder.CreateICmpSGT(exp_phi, zero);
+            Builder.CreateCondBr(gt, body_bb, done_bb);
+
+            Builder.SetInsertPoint(body_bb);
+            auto* new_res = is_fp ? Builder.CreateFMul(res_phi, lhs) : Builder.CreateMul(res_phi, lhs);
+            auto* dec = Builder.CreateSub(exp_phi, llvm::ConstantInt::get(rhs->getType(), 1));
+            res_phi->addIncoming(new_res, body_bb);
+            exp_phi->addIncoming(dec, body_bb);
+            Builder.CreateBr(cond_bb);
+
+            Builder.SetInsertPoint(done_bb);
+            Builder.CreateStore(res_phi, lhs_ptr);
+            return {};
+        }
+
+        default:
+            throw std::runtime_error("LLVMBackend: unknown operator");
+    }
+}
+
+
+CGValue LLVMBackend::llvmCodegen(const StrLit* node, const SwContext& context) {
+    auto ptr = Builder.CreateGlobalString(
+        node->value, "", 0, getLLVMModule(), false);
 
     return CGValue::rValue(llvm::ConstantStruct::get(
-        llvm::dyn_cast<llvm::StructType>(GlobalTypeStr.llvmCodegen(instance)), {
+        llvm::dyn_cast<llvm::StructType>(codegen(&GlobalTypeStr, context)), {
             ptr,
-            llvm::dyn_cast<llvm::Constant>(instance.toLLVMInt(value.size()))
-        }));
+            llvm::dyn_cast<llvm::Constant>(toLLVMInt(node->value.size()))
+        }), TypeManager.lookupType(SymMan.getIdInfoOfAGlobal("str")));
 }
 
 
-CGValue BoolLit::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    return CGValue::rValue(llvm::ConstantInt::getBool(instance.Context, value));
+CGValue LLVMBackend::llvmCodegen(const CharLit* node, const SwContext& context) {
+    return CGValue::rValue(llvm::ConstantInt::get(
+        llvm::Type::getInt8Ty(LLVMContext),
+        static_cast<uint64_t>(node->value)
+    ), &GlobalTypeI8);
+}
+
+
+CGValue LLVMBackend::llvmCodegen(Ident* node, const SwContext& context) {
+    const auto e = SymMan.lookupDecl(node->value);
+
+    // handle enum contained IDs
+    if (node->value->isFictitious()) {
+        const auto enum_node = SymMan.getFictitiousIDValue(node->value);
+        return CGValue{nullptr, llvm::ConstantInt::get(
+            codegen(enum_node->enum_type.value()->type, context),
+            enum_node->entries.at(node->full_qualification.back().name)),
+            enum_node->enum_type.value()->type};
+    }
+
+    // IDs of global variables
+    if (!isLocalScope()) {
+        auto global_var = llvm::dyn_cast<llvm::GlobalVariable>(e.llvm_value);
+        return CGValue::rValue(global_var->getInitializer(), e.swirl_type);
+    }
+
+    // parameters are passed by value
+    if (e.is_param) {
+        return CGValue::rValue(e.llvm_value, e.swirl_type);
+    }
+
+    if (e.swirl_type->isStructType()) {
+        return CGValue::lValue(e.llvm_value, e.swirl_type);
+    }
+
+    return {e.llvm_value, nullptr, e.swirl_type};
+}
+
+
+CGValue LLVMBackend::llvmCodegen(const Function* node, const SwContext& context) {
+    const bool early_return =
+        !node->generic_params.empty() &&
+        !node->is_monomorphization    ||
+        (!node->params.empty() && node->params.back()->is_variadic);
+
+    if (early_return)
+        return {};
+
+    const auto fn_sw_type = TypeManager.lookupType(node->ident)->to<FunctionType>();
+
+    const auto name = mangleString(node->ident, {.is_generic = true, .generic_args = context.generic_args});
+
+    const auto linkage = (node->is_exported || node->is_extern || node->ident->toString() == "main"
+                         ) ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
+
+    auto* fn_type  = llvm::dyn_cast<llvm::FunctionType>(codegen(fn_sw_type, context));
+
+    // check whether the function has been declared before, if not, create a new one
+    llvm::Function* func = LModule->getFunction(name);
+    if (!func) {
+        func = llvm::Function::Create(fn_type, linkage, name, LModule.get());
+    }
+
+
+    SW_LLVM_SET_CURRENT_PARENT(func);
+
+    if (node->is_extern) {
+        if (node->extern_attributes == "C")
+            func->setCallingConv(llvm::CallingConv::C);
+        return {};
+    }
+
+    llvm::BasicBlock*   entry_bb = llvm::BasicBlock::Create(LLVMContext, "entry", func);
+
+    Builder.SetInsertPoint(entry_bb);
+
+    for (unsigned int i = 0; i < node->params.size(); i++) {
+        const auto p_name = node->params[i]->ident;
+        [[maybe_unused]] const auto param = func->getArg(i);
+        // param->setName(p_name->toString());
+
+        SymMan.lookupDecl(p_name).llvm_value = func->getArg(i);
+    }
+
+    codegenChildrenUntilRet(node->children, context);
+    if (!Builder.GetInsertBlock()->back().isTerminator()
+        || Builder.GetInsertBlock()->empty())
+        Builder.CreateRetVoid();
+
+    return {};
+}
+
+
+CGValue LLVMBackend::llvmCodegen(Condition* node, const SwContext& context) {
+    const auto parent      = Builder.GetInsertBlock()->getParent();
+    const auto if_block    = llvm::BasicBlock::Create(LLVMContext, "if", parent);
+    const auto else_block  = llvm::BasicBlock::Create(LLVMContext, "else", parent);
+    const auto merge_block = llvm::BasicBlock::Create(LLVMContext, "merge", parent);
+
+    const auto if_cond = codegen(node->bool_expr, context).getRValue(*this, context);
+    Builder.CreateCondBr(if_cond, if_block, else_block);
+
+    {
+        Builder.SetInsertPoint(if_block);
+        codegenChildrenUntilRet(node->if_children, context, if_cond);
+
+        // insert a jump to the merge block if the scope either doesn't end with a
+        // terminator or is empty
+        if (!Builder.GetInsertBlock()->back().isTerminator() ||
+            Builder.GetInsertBlock()->empty())
+            Builder.CreateBr(merge_block);
+    }
+
+    {
+        Builder.SetInsertPoint(else_block);
+
+        for (auto& [condition, children] : node->elif_children) {
+            const auto cnd = codegen(condition, context).getRValue(*this, context);
+
+            auto elif_block = llvm::BasicBlock::Create(LLVMContext, "elif", parent);
+            auto next_elif  = llvm::BasicBlock::Create(LLVMContext, "next_elif", parent);
+
+            Builder.CreateCondBr(cnd, elif_block, next_elif);
+            Builder.SetInsertPoint(elif_block);
+            codegenChildrenUntilRet(children, context, cnd);
+
+            // insert a jump to the merge block if the scope either doesn't end with a
+            // terminator or is empty
+            if (!Builder.GetInsertBlock()->back().isTerminator() ||
+                Builder.GetInsertBlock()->empty())
+                Builder.CreateBr(merge_block);
+
+            Builder.SetInsertPoint(next_elif);
+        }
+
+        codegenChildrenUntilRet(node->else_children, context);
+
+        // insert a jump to the merge block if the scope either doesn't end with a
+        // terminator or is empty
+        if (!Builder.GetInsertBlock()->back().isTerminator() ||
+            Builder.GetInsertBlock()->empty())
+            Builder.CreateBr(merge_block);
+
+        Builder.SetInsertPoint(merge_block);
+    }
+
+    return {};
+}
+
+
+CGValue LLVMBackend::llvmCodegen(WhileLoop* node, SwContext context) {
+    const auto parent = Builder.GetInsertBlock()->getParent();
+    const auto last_inst = Builder.GetInsertBlock()->getTerminator();
+
+    const auto cond_block  = llvm::BasicBlock::Create(LLVMContext, "while_cond", parent);
+    const auto body_block  = llvm::BasicBlock::Create(LLVMContext, "while_body", parent);
+    const auto merge_block = llvm::BasicBlock::Create(LLVMContext, "merge", parent);
+
+    if (last_inst == nullptr)
+        Builder.CreateBr(cond_block);
+
+    Builder.SetInsertPoint(cond_block);
+    const auto expr  = codegen(node->condition, context).getRValue(*this, context);
+    Builder.CreateCondBr(expr, body_block, merge_block);
+
+
+    context.break_to = merge_block;
+    context.continue_to = cond_block;
+
+    {
+        Builder.SetInsertPoint(body_block);
+        codegenChildrenUntilRet(node->children, context);
+
+        if (!Builder.GetInsertBlock()->back().isTerminator() ||
+            Builder.GetInsertBlock()->empty())
+            Builder.CreateBr(cond_block);
+    }
+
+    Builder.SetInsertPoint(merge_block);
+    return {};
 }
 
 
 /// Writes the array literal to 'BoundMemory' if not null, otherwise creates a temporary and
 /// returns a load of it.
-CGValue ArrayLit::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    assert(!elements.empty());
-    Type* element_type = elements.at(0).expr_type;
-    Type* sw_arr_type  = instance.SymMan.getArrayType(element_type, elements.size());
+CGValue LLVMBackend::llvmCodegen(ArrayLit* node, const SwContext& context) {
+    assert(!node->elements.empty());
+    Type* element_type = node->elements.at(0)->expr_type;
+    Type* sw_arr_type  = TypeManager.getArrayType(element_type, node->elements.size());
 
-    if (!instance.isLocalScope()) {
-        if (instance.BoundMemory) {
-            auto arr_type = llvm::ArrayType::get(element_type->llvmCodegen(instance), elements.size());
+    if (!isLocalScope()) {
+        if (context.bound_memory) {
+            auto arr_type = llvm::ArrayType::get(codegen(element_type, context), node->elements.size());
 
             std::vector<llvm::Constant*> val_array;
-            val_array.reserve(elements.size());
-            for (auto& elem : elements) {
-                instance.setBoundTypeState(element_type);
+            val_array.reserve(node->elements.size());
+            for (auto& elem : node->elements) {
+                auto new_ctx = context;
+                new_ctx.bound_type = element_type;
                 val_array.push_back(llvm::dyn_cast<llvm::Constant>(
-                    elem.llvmCodegen(instance).getRValue(instance)));
-                instance.restoreBoundTypeState();
+                    codegen(elem, new_ctx).getRValue(*this, new_ctx)));
             }
 
             auto array_init = llvm::ConstantArray::get(arr_type, val_array);
@@ -234,619 +1116,135 @@ CGValue ArrayLit::llvmCodegen(LLVMBackend &instance) {
             std::vector<llvm::Type*> members = {arr_type};
 
             auto const_struct = llvm::ConstantStruct::get(
-                llvm::dyn_cast<llvm::StructType>(sw_arr_type->llvmCodegen(instance)),
+                llvm::dyn_cast<llvm::StructType>(codegen(sw_arr_type, context)),
                 {array_init}
-                );
-            return CGValue::rValue(const_struct);
+            );
+            return CGValue::rValue(const_struct, TypeManager.getArrayType(element_type, node->elements.size()));
         }
     }
 
     // the array-type which is enclosed within a struct
-    assert(instance.getBoundLLVMType()->isStructTy());
-    llvm::Type*  arr_type = instance.getBoundLLVMType()->getStructElementType(0);
+    assert(codegen(context.bound_type, context)->isStructTy());
+    llvm::Type*  arr_type = codegen(context.bound_type, context)->getStructElementType(0);
     llvm::Value* ptr  = nullptr;  // the to-be-calculated pointer to where the array is supposed to be written
-    llvm::Value* bound_mem_cache = nullptr;
 
     // if this flag is set, the literal shall be written to the storage that it represents
-    if (instance.BoundMemory) {
+    if (context.bound_memory) {
         // set llvm_value = array member
-        auto base_ptr = instance.Builder.CreateStructGEP(instance.getBoundLLVMType(), instance.BoundMemory, 0);
+        auto base_ptr = Builder.CreateStructGEP(codegen(context.bound_type, context), context.bound_memory, 0);
 
-        for (auto [i, element] : llvm::enumerate(elements)) {
-            ptr = instance.Builder.CreateGEP(arr_type, base_ptr, {instance.toLLVMInt(0), instance.toLLVMInt(i)});
-            if (element.expr_type->getTypeTag() == Type::ARRAY) {
-                bound_mem_cache = instance.BoundMemory;
-                instance.BoundMemory = ptr;
-                instance.setBoundTypeState(element_type);
-                element.llvmCodegen(instance);
-                instance.restoreBoundTypeState();
+        for (auto [i, element] : llvm::enumerate(node->elements)) {
+            ptr = Builder.CreateGEP(arr_type, base_ptr, {toLLVMInt(0), toLLVMInt(i)});
+            if (element->expr_type->isArrayType()) {
+                auto new_ctx = context;
+                new_ctx.bound_memory = ptr;
+                new_ctx.bound_type = element_type;
+                codegen(element, new_ctx);
                 continue;
-            } instance.Builder.CreateStore(element.llvmCodegen(instance).getRValue(instance), ptr);
+            } Builder.CreateStore(codegen(element, context).getRValue(*this, context), ptr);
         }
-        if (bound_mem_cache) instance.BoundMemory = bound_mem_cache;
-        return {nullptr, nullptr};
+
+        return {};
     }
 
-    auto tmp = instance.Builder.CreateAlloca(instance.getBoundLLVMType());
-    auto base_ptr = instance.Builder.CreateStructGEP(instance.getBoundLLVMType(), tmp, 0);
+    const auto tmp = Builder.CreateAlloca(codegen(context.bound_type, context));
+    const auto base_ptr = Builder.CreateStructGEP(codegen(context.bound_type, context), tmp, 0);
 
-
-    for (auto [i, element] : llvm::enumerate(elements)) {
-        ptr = instance.Builder.CreateGEP(arr_type, base_ptr, {instance.toLLVMInt(0), instance.toLLVMInt(i)});
-        if (element.expr_type->getTypeTag() == Type::ARRAY) {
-            bound_mem_cache = instance.BoundMemory;
-            instance.BoundMemory = ptr;
-            instance.setBoundTypeState(element_type);
-            element.llvmCodegen(instance);
-            instance.restoreBoundTypeState();
+    for (auto [i, element] : llvm::enumerate(node->elements)) {
+        ptr = Builder.CreateGEP(arr_type, base_ptr, {toLLVMInt(0), toLLVMInt(i)});
+        if (element->expr_type->isArrayType()) {
+            auto new_ctx = context;
+            new_ctx.bound_memory = ptr;
+            new_ctx.bound_type = element_type;
+            codegen(element, new_ctx);
             continue;
-        } instance.Builder.CreateStore(element.llvmCodegen(instance).getRValue(instance), ptr);
+        } Builder.CreateStore(codegen(element, context).getRValue(*this, context), ptr);
     }
 
-    if (bound_mem_cache)
-        instance.BoundMemory = bound_mem_cache;
-
-    auto tmp_load = instance.Builder.CreateLoad(instance.getBoundLLVMType(), tmp);
+    auto tmp_load = Builder.CreateLoad(codegen(context.bound_type, context), tmp);
     assert(tmp_load);
-    return CGValue::rValue(tmp_load);
+    return CGValue::rValue(tmp_load, TypeManager.getArrayType(element_type, node->elements.size()));
 }
 
 
-CGValue Ident::llvmCodegen(LLVMBackend& instance) {
-    PRE_SETUP();
-    const auto e = instance.SymMan.lookupDecl(this->value);
-
-    if (!instance.isLocalScope()) {
-        auto global_var = llvm::dyn_cast<llvm::GlobalVariable>(e.llvm_value);
-        return CGValue::rValue(global_var->getInitializer());
-    }
-
-    // parameters are passed by value
-    if (e.is_param) {
-        return CGValue::rValue(e.llvm_value);
-    }
-
-    // return e.is_param
-    // ? CGValue::lValue(instance.castIfNecessary(e.swirl_type, e.llvm_value))
-    // : CGValue::lValue();
-
-    return {e.llvm_value, instance.castIfNecessary(
-        e.swirl_type, instance.Builder.CreateLoad(
-            e.swirl_type->llvmCodegen(instance), e.llvm_value))};
+CGValue LLVMBackend::llvmCodegen(const TypeWrapper* node, const SwContext& context) {
+    return CGValue::rValue(llvm::UndefValue::get(codegen(node->type, context)), node->type);
 }
 
 
-CGValue ImportNode::llvmCodegen([[maybe_unused]] LLVMBackend &instance) {
-    return {nullptr, nullptr};
+CGValue LLVMBackend::llvmCodegen(BoolLit* node, const SwContext& context) {
+    return CGValue::rValue(llvm::ConstantInt::getBool(LLVMContext, node->value), &GlobalTypeBool);
 }
 
 
-CGValue Scope::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    assert(instance.getCurrentParent() != nullptr);
+CGValue LLVMBackend::llvmCodegen(Scope* node, const SwContext& context) {
+    assert(getCurrentParent() != nullptr);
 
     // create a new basic block if:
     // - no active basic blocks exist, or
     // - the last active basic block's last instruction is a terminator
     if (
-        !instance.Builder.GetInsertBlock() ||
-        instance.Builder.GetInsertBlock()->back().isTerminator()
-        ) {
+        !Builder.GetInsertBlock() ||
+        Builder.GetInsertBlock()->back().isTerminator()
+    ) {
 
         auto bb = llvm::BasicBlock::Create(
-           instance.Context,
-           "scope_0",
-           instance.getCurrentParent()
-           );
+            LLVMContext,
+            "scope_0",
+            getCurrentParent()
+        );
 
-        instance.Builder.SetInsertPoint(bb);
+        Builder.SetInsertPoint(bb);
     }
 
-    for (auto& node : children) {
-        if (node->getNodeType() == ND_INVALID) {
+    for (auto& child : node->children) {
+        if (child->getNodeType() == ND_INVALID) {
             continue;
-        } node->llvmCodegen(instance);
-    } return {nullptr, nullptr};
+        } codegen(child, context);
+    } return {};
 }
 
 
-CGValue Function::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    if (!generic_params.empty())
-        return {};
-
-    const auto fn_sw_type = dynamic_cast<FunctionType*>(instance.SymMan.lookupType(ident));
-
-    auto name = is_extern || ident->toString() == "main" ?
-        ident->toString() :
-        instance.mangleString(ident);
-
-    auto linkage = (
-        is_exported || is_extern || ident->toString() == "main"
-        ) ? llvm::GlobalValue::ExternalLinkage : llvm::GlobalValue::InternalLinkage;
-
-    auto*               fn_type  = llvm::dyn_cast<llvm::FunctionType>(fn_sw_type->llvmCodegen(instance));
-    llvm::Function*     func     = llvm::Function::Create(fn_type, linkage, name, instance.LModule.get());
-
-    instance.setCurrentParent(func);
-
-    if (is_extern) {
-        if (extern_attributes == "C")
-            func->setCallingConv(llvm::CallingConv::C);
-        return {nullptr, nullptr};
-    }
-
-    llvm::BasicBlock*   entry_bb = llvm::BasicBlock::Create(instance.Context, "entry", func);
-
-    instance.Builder.SetInsertPoint(entry_bb);
-
-    for (unsigned int i = 0; i < params.size(); i++) {
-        const auto p_name = params[i].var_ident;
-        [[maybe_unused]] const auto param = func->getArg(i);
-        // param->setName(p_name->toString());
-
-        instance.SymMan.lookupDecl(p_name).llvm_value = func->getArg(i);
-    }
-
-    instance.codegenChildrenUntilRet(children);
-    if (!instance.Builder.GetInsertBlock()->back().isTerminator()
-        || instance.Builder.GetInsertBlock()->empty())
-        instance.Builder.CreateRetVoid();
-
-    instance.setCurrentParent(nullptr);
-    return {nullptr, nullptr};
+CGValue LLVMBackend::llvmCodegen(BreakStmt* node, const SwContext& context) {
+    assert(context.break_to);
+    Builder.CreateBr(context.break_to);
+    return {};
 }
 
 
-CGValue ReturnStatement::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    if (value.expr) {
-        assert(parent_fn_type->ret_type != nullptr);
-        SET_BOUND_TYPE_STATE(parent_fn_type->ret_type);
-        llvm::Value* ret = value.llvmCodegen(instance).getRValue(instance);
-        instance.Builder.CreateRet(ret);
-        return {nullptr, nullptr};
-    }
-
-    instance.Builder.CreateRetVoid();
-    return {nullptr, nullptr};
+CGValue LLVMBackend::llvmCodegen(ContinueStmt* node, const SwContext& context) {
+    assert(context.continue_to);
+    Builder.CreateBr(context.continue_to);
+    return {};
 }
 
 
-CGValue Op::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    assert(common_type);
-    SET_BOUND_TYPE_STATE(common_type);
-
-    switch (op_type) {
-        case UNARY_ADD:
-            return operands.back()->llvmCodegen(instance);
-
-        case UNARY_SUB:
-            return
-            CGValue::rValue(instance.Builder.CreateNeg(operands.back()->llvmCodegen(instance).getRValue(instance)));
-
-        case BINARY_ADD: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            if (instance.getBoundTypeState()->isIntegral()) {
-                return CGValue::rValue(instance.Builder.CreateAdd(lhs, rhs));
-            }
-
-            assert(lhs->getType()->isFloatingPointTy() && rhs->getType()->isFloatingPointTy());
-            return CGValue::rValue(instance.Builder.CreateFAdd(lhs, rhs));
-        }
-
-        case BINARY_SUB: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            if (instance.getBoundTypeState()->isIntegral()) {
-                return CGValue::rValue(instance.Builder.CreateSub(lhs, rhs));
-            }
-            return CGValue::rValue(instance.Builder.CreateFSub(lhs, rhs));
-        }
-
-        case MUL: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            if (instance.getBoundTypeState()->isIntegral()) {
-                return CGValue::rValue(instance.Builder.CreateMul(lhs, rhs));
-            }
-
-            return CGValue::rValue(instance.Builder.CreateFMul(lhs, rhs));
-        }
-
-        case DEREFERENCE: {
-            // preserve the l-value of the operand
-            auto operand = getLHS()->llvmCodegen(instance);
-            return CGValue::lValue(operand.getRValue(instance));
-        }
-
-        case ADDRESS_TAKING: {
-            auto operand = getLHS()->getWrappedNodeOrInstance();
-            Type* type = instance.fetchSwType(operand);
-
-            // handle slice-creation for array types
-            if (type->getTypeTag() == Type::ARRAY && !common_type->isPointerType()) {
-                auto slice_type = instance.SymMan.getSliceType(type->getWrappedType(), is_mutable);
-
-                auto slice_llvm_ty = slice_type->llvmCodegen(instance);
-
-                auto slice_instance = instance.Builder.CreateAlloca(slice_llvm_ty);
-                auto ptr_field = instance.Builder.CreateStructGEP(
-                    slice_llvm_ty,
-                    slice_instance,
-                    0
-                );
-
-                auto size_field = instance.Builder.CreateStructGEP(
-                    slice_llvm_ty,
-                    slice_instance,
-                    1
-                );
-
-                auto arr_instance_ptr = operand->llvmCodegen(instance);
-
-                // calculate the pointer to the array
-                auto element_ptr = instance.Builder.CreateStructGEP(
-                    type->llvmCodegen(instance),
-                    arr_instance_ptr.getLValue(),
-                    0
-                    );
-
-                instance.Builder.CreateStore(element_ptr, ptr_field);
-                instance.Builder.CreateStore(
-                    instance.toLLVMInt(type->getAggregateSize()),
-                    size_field
-                    );
-
-                return CGValue::rValue(llvm::dyn_cast<llvm::Value>(slice_instance));
-            }
-
-            if (operand->getNodeType() == ND_IDENT) {
-                auto& tab_entry = instance.SymMan.lookupDecl(operand->getIdentInfo());
-                auto op_address = tab_entry.llvm_value;
-                assert(op_address->getType()->isPointerTy());
-
-                instance.RefMemory = op_address;
-
-                return CGValue{op_address, op_address};
-
-            } throw;
-        }
-
-        case DIV: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            if (instance.getBoundTypeState()->isFloatingPoint()) {
-                return CGValue::rValue(instance.Builder.CreateFDiv(lhs, rhs));
-            }
-            if (instance.getBoundTypeState()->isUnsigned()) {
-                return CGValue::rValue(instance.Builder.CreateUDiv(lhs, rhs));
-            }
-
-            return CGValue::rValue(instance.Builder.CreateSDiv(lhs, rhs));
-        }
-
-        case MOD: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            // SemanticAnalysis ascertains that integral types are used
-            if (instance.getBoundTypeState()->isUnsigned()) {
-                return CGValue::rValue(instance.Builder.CreateURem(lhs, rhs));
-            }
-
-            return CGValue::rValue(instance.Builder.CreateSRem(lhs, rhs));
-        }
-
-        case CAST_OP: {
-            assert(operands.at(1)->getNodeType() == ND_TYPE);
-            SET_BOUND_TYPE_STATE(operands.at(1)->getSwType());
-            return CGValue::rValue(instance.castIfNecessary(instance.fetchSwType(
-                operands.at(0)), getLHS()->llvmCodegen(instance).getRValue(instance)));
-            assert(0);
-        }
-
-        case LOGICAL_EQUAL: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            assert(lhs->getType() == rhs->getType());
-
-            if (lhs->getType()->isFloatingPointTy()) {
-                return CGValue::rValue(instance.Builder.CreateFCmpOEQ(lhs, rhs));
-            }
-
-            if (lhs->getType()->isIntegerTy()) {
-                return CGValue::rValue(instance.Builder.CreateICmpEQ(lhs, rhs));
-            }
-            throw;
-        }
-
-        case LOGICAL_NOTEQUAL: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            assert(lhs->getType() == rhs->getType());
-
-            if (lhs->getType()->isFloatingPointTy()) {
-                return CGValue::rValue(instance.Builder.CreateFCmpONE(lhs, rhs));
-            }
-
-            if (lhs->getType()->isIntegerTy()) {
-                return CGValue::rValue(instance.Builder.CreateICmpNE(lhs, rhs));
-            }
-            throw;
-        }
-
-        case LOGICAL_AND: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            return CGValue::rValue(instance.Builder.CreateLogicalAnd(lhs, rhs));
-        }
-
-        case LOGICAL_NOT: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            return CGValue::rValue(instance.Builder.CreateNot(lhs));
-        }
-
-        case LOGICAL_OR: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            return CGValue::rValue(instance.Builder.CreateLogicalOr(lhs, rhs));
-        }
-
-        case GREATER_THAN: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            auto lhs_type = instance.fetchSwType(operands.at(0));
-            auto rhs_type = instance.fetchSwType(operands.at(1));
-
-            assert(lhs->getType() == rhs->getType());
-
-            if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
-                return CGValue::rValue(instance.Builder.CreateFCmpOGT(lhs, rhs));
-            }
-
-            if (lhs_type->isUnsigned() && rhs_type->isUnsigned()) {
-                return CGValue::rValue(instance.Builder.CreateICmpUGT(lhs, rhs));
-            }
-
-            return CGValue::rValue(instance.Builder.CreateICmpSGT(lhs, rhs));
-        }
-
-        case GREATER_THAN_OR_EQUAL: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            auto lhs_type = instance.fetchSwType(operands.at(0));
-            auto rhs_type = instance.fetchSwType(operands.at(1));
-
-            assert(lhs->getType() == rhs->getType());
-
-            if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
-                return CGValue::rValue(instance.Builder.CreateFCmpOGE(lhs, rhs));
-            }
-
-            if (lhs_type->isUnsigned() && rhs_type->isUnsigned()) {
-                return CGValue::rValue(instance.Builder.CreateICmpUGE(lhs, rhs));
-            }
-
-            return CGValue::rValue(instance.Builder.CreateICmpSGE(lhs, rhs));
-        }
-
-        case LESS_THAN: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            auto lhs_type = instance.fetchSwType(operands.at(0));
-            auto rhs_type = instance.fetchSwType(operands.at(1));
-
-            assert(lhs->getType() == rhs->getType());
-
-            if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
-                return CGValue::rValue(instance.Builder.CreateFCmpOLT(lhs, rhs));
-            }
-
-            if (lhs_type->isUnsigned() && rhs_type->isUnsigned()) {
-                return CGValue::rValue(instance.Builder.CreateICmpULT(lhs, rhs));
-            }
-
-            return CGValue::rValue(instance.Builder.CreateICmpSLT(lhs, rhs));
-        }
-
-        case LESS_THAN_OR_EQUAL: {
-            llvm::Value* lhs = getLHS()->llvmCodegen(instance).getRValue(instance);
-            llvm::Value* rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            auto lhs_type = instance.fetchSwType(operands.at(0));
-            auto rhs_type = instance.fetchSwType(operands.at(1));
-
-            assert(lhs->getType() == rhs->getType());
-
-            if (lhs_type->isFloatingPoint() || rhs_type->isFloatingPoint()) {
-                return CGValue::rValue(instance.Builder.CreateFCmpOLE(lhs, rhs));
-            }
-
-            if (lhs_type->isUnsigned() && rhs_type->isUnsigned()) {
-                return CGValue::rValue(instance.Builder.CreateICmpULE(lhs, rhs));
-            }
-
-            return CGValue::rValue(instance.Builder.CreateICmpSLE(lhs, rhs));
-        }
-
-        case ASSIGNMENT: {
-            auto lhs = getLHS()->llvmCodegen(instance).getLValue();
-            SET_BOUND_TYPE_STATE(common_type);
-            auto rhs = getRHS()->llvmCodegen(instance).getRValue(instance);
-
-            assert(lhs->getType()->isPointerTy());
-            instance.Builder.CreateStore(rhs, lhs);
-            return {};
-        }
-
-        case INDEXING_OP: {
-            auto underlying_type = instance.fetchSwType(operands.at(0))->getWrappedType();
-
-            auto operand_llvm_ty = instance.fetchSwType(operands.at(0))->llvmCodegen(instance);
-
-            auto arr_ptr = instance.Builder.CreateStructGEP(
-                operand_llvm_ty,  getLHS()->llvmCodegen(instance).getLValue(), 0);
-
-            llvm::Value* second_op;
-            instance.setBoundTypeState(instance.fetchSwType(operands.at(1)));
-            second_op = operands.at(1)->llvmCodegen(instance).getRValue(instance);
-            instance.restoreBoundTypeState();
-
-            auto element_ptr = instance.Builder.CreateGEP(
-                operand_llvm_ty->getStructElementType(0),
-                arr_ptr,
-                {instance.toLLVMInt(0), second_op}
-                );
-
-            assert(element_ptr != nullptr);
-            instance.ComputedPtr = element_ptr;
-            return CGValue::lValue(element_ptr);
-            // return instance.Builder.CreateLoad(underlying_type->llvmCodegen(instance), element_ptr);
-        }
-
-        case DOT: {
-            // when nested
-            if (operands.at(0)->getNodeType() == ND_OP) {
-                auto inst_ptr = operands.at(0)->llvmCodegen(instance).getLValue();
-
-                auto field_node = dynamic_cast<Ident*>(operands.at(1).get());
-                auto struct_ty  = dynamic_cast<StructType*>(instance.StructFieldType);
-
-                auto field_ptr = instance.Builder.CreateStructGEP(
-                    instance.StructFieldType->llvmCodegen(instance),
-                    inst_ptr,
-                    static_cast<unsigned int>
-                    (struct_ty->field_offsets.at(field_node->full_qualification.front().name))
-                );
-
-                auto field_ty = instance.SymMan.lookupDecl(field_node->value).swirl_type;
-
-                instance.StructFieldType = field_ty;
-                instance.StructFieldPtr = field_ptr;
-                instance.ComputedPtr = field_ptr;
-
-                return CGValue::lValue(field_ptr);
-                // instance.Builder.CreateLoad(
-                //     field_ty->llvmCodegen(instance),
-                //     field_ptr
-                // );
-            // ---- * ---- * ---- * ---- * ---- //
-            } else {  // otherwise...
-                auto inst_ptr = operands.at(0)->llvmCodegen(instance).getLValue();
-
-                // in the special case when dot is using with pure-rvalues
-                // e.g., functions returning struct instances
-                if (!inst_ptr->getType()->isPointerTy()) {
-                    auto tmp = instance.Builder.CreateAlloca(inst_ptr->getType());
-                    instance.Builder.CreateStore(inst_ptr, tmp);
-                    inst_ptr = tmp;
-                }
-
-                // fetch the instance's struct-type
-                auto struct_sw_ty = instance.fetchSwType(operands.at(0));
-                auto struct_ty = dynamic_cast<StructType*>(struct_sw_ty->getWrappedTypeOrInstance());
-
-                // handle the special case of methods, lower them into regular function calls
-                if (operands.at(1)->getNodeType() == ND_CALL) {
-                    instance.setManglingContext({.encapsulator = struct_sw_ty});
-                    instance.ComputedPtr = inst_ptr;  // set ComputedPtr for the FuncCall node to grab it
-                    auto ret = operands.at(1)->llvmCodegen(instance);
-                    instance.restoreManglingContext();
-                    return ret;
-                }
-
-                assert(struct_ty != nullptr);
-                auto field_node = dynamic_cast<Ident*>(operands.at(1).get());
-                auto field_ptr = instance.Builder.CreateStructGEP(
-                    struct_ty->llvmCodegen(instance),
-                    inst_ptr,
-                    static_cast<unsigned int>
-                    (struct_ty->field_offsets.at(field_node->full_qualification.front().name))
-                );
-
-                // in the case of this operator, the common_type is supposed to be the type of the field
-                // beind accessed, not an actual common type between operands
-                auto field_type = common_type;
-
-                instance.StructFieldPtr = field_ptr;
-                instance.StructFieldType = field_type;
-                instance.ComputedPtr = field_ptr;
-
-                return CGValue::lValue(field_ptr);
-                // instance.Builder.CreateLoad(
-                //     field_type->llvmCodegen(instance),
-                //     field_ptr
-                // );
-            }
-        }
-        default: break;
-    }
-
-    using namespace std::string_view_literals;
-
-    if (value.ends_with("=") && ("+-*/%~&^"sv.find(value.at(0)) != std::string::npos)) {
-        auto op = std::make_unique<Op>(std::string_view{value.data(), 1}, 2);
-        op->operands.push_back(std::move(operands.at(0)));
-        op->operands.push_back(std::move(operands.at(1)));
-        op->common_type = common_type;
-
-        instance.setBoundTypeState(instance.fetchSwType(op->operands.at(1)));
-        auto rhs = op->llvmCodegen(instance).getRValue(instance);
-        instance.restoreBoundTypeState();
-
-        auto lhs = op->operands.at(0)->llvmCodegen(instance).getLValue();
-
-        instance.Builder.CreateStore(rhs, lhs);
-        return {};
-    }
-
-    throw;
-}
-
-
-CGValue TypeWrapper::llvmCodegen(LLVMBackend &instance) {
-    return CGValue::rValue(llvm::UndefValue::get(type->llvmCodegen(instance)));
-}
-
-
-CGValue Intrinsic::llvmCodegen(LLVMBackend &instance) {
-    switch (intrinsic_type) {
-        case SIZEOF: {
-            llvm::Type* val_type = args.at(0).llvmCodegen(instance).getRValue(instance)->getType();
+CGValue LLVMBackend::llvmCodegen(Intrinsic* node, const SwContext& context) {
+    switch (node->intrinsic_type) {
+        case Intrinsic::SIZEOF: {
+            llvm::Type* val_type = codegen(node->args.at(0), context).getRValue(*this, context)->getType();
             if (val_type->isPointerTy()) {
-                return CGValue::rValue(instance.toLLVMInt(instance.getDataLayout().getPointerSize(0)));
+                return CGValue::rValue(toLLVMInt(getDataLayout().getPointerSize(0)), &GlobalTypeI64);
             } if (val_type->isVoidTy()) {
-                return CGValue::rValue(instance.toLLVMInt(0));
-            } return CGValue::rValue(instance.toLLVMInt(instance.getDataLayout().getTypeSizeInBits(val_type) / 8));
+                return CGValue::rValue(toLLVMInt(0), &GlobalTypeI64);
+            } return CGValue::rValue(
+                toLLVMInt(getDataLayout().getTypeSizeInBits(val_type).getFixedValue() / 8),
+                &GlobalTypeI64);
         }
-        case TYPEOF:
-            return args.at(0).llvmCodegen(instance);
-        case ADV_PTR: {
-            assert(args.size() == 2);
-            assert(args.at(0).expr_type->isPointerType());
-            assert(args.at(1).expr_type->isIntegral());
+        case Intrinsic::TYPEOF:
+            return codegen(node->args.at(0), context);
+        case Intrinsic::ADV_PTR: {
+            assert(node->args.size() == 2);
+            assert(node->args.at(0)->expr_type->isPointerType());
+            assert(node->args.at(1)->expr_type->isIntegral());
 
-            llvm::Value* ptr = args.at(0).llvmCodegen(instance).getRValue(instance);
-            std::array operands{args.at(1).llvmCodegen(instance).getRValue(instance)};
+            llvm::Value* ptr = codegen(node->args.at(0), context).getRValue(*this, context);
+            std::array operands{codegen(node->args.at(1), context).getRValue(*this, context)};
 
-            return CGValue::rValue(instance.Builder.CreateGEP(
-                args.at(0).expr_type->getWrappedType()->llvmCodegen(instance),
+            return CGValue::rValue(Builder.CreateGEP(
+                codegen(node->args.at(0)->expr_type->getWrappedType(), context),
                 ptr, operands
-                ));
+            ), node->args.at(0)->expr_type);
         }
 
         default:
@@ -855,279 +1253,176 @@ CGValue Intrinsic::llvmCodegen(LLVMBackend &instance) {
 }
 
 
-llvm::Value* LLVMBackend::castIfNecessary(Type* source_type, llvm::Value* subject) {
-    // perform implicit-dereferencing, if applicable
-    if (source_type->getTypeTag() == Type::REFERENCE) {
-        auto referenced_type = dynamic_cast<ReferenceType*>(source_type)->of_type;
-        if (!(getBoundTypeState()->getTypeTag() == Type::REFERENCE)) {
-            subject = Builder.CreateLoad(
-                referenced_type->llvmCodegen(*this),
-                subject, "implicit_deref"
-                );
-        } source_type = referenced_type;
+CGValue LLVMBackend::llvmCodegen(ReturnStatement* node, const SwContext& context) {
+    if (node->value->expr) {
+        assert(node->parent_fn_type->ret_type != nullptr);
+        auto new_ctx = context;
+        new_ctx.bound_type = node->parent_fn_type->ret_type;
+        llvm::Value* ret = codegen(node->value, new_ctx).getRValue(*this, new_ctx);
+        Builder.CreateRet(ret);
+        return {};
     }
 
-    // if (source_type->isPointerType() && getBoundTypeState()->isIntegral()) {
-    //     return Builder.CreatePtrToInt(subject, getBoundTypeState()->llvmCodegen(*this));
-    // }
-
-    if (getBoundTypeState() != source_type && source_type->getTypeTag() != Type::STRUCT) {
-        if (getBoundTypeState()->isIntegral() || getBoundTypeState()->getTypeTag() == Type::BOOL) {
-            // if the destination type is unsigned or if the source type is boolean
-            // perform a zero-extension or truncation
-            if (source_type->isIntegral()) {
-                if (getBoundTypeState()->isUnsigned() || source_type->getTypeTag() == Type::BOOL) {
-                    return Builder.CreateZExtOrTrunc(subject, getBoundLLVMType());
-                } return Builder.CreateSExtOrTrunc(subject, getBoundLLVMType());
-            }
-        }
-
-        if (getBoundTypeState()->isFloatingPoint()) {
-            if (source_type->isFloatingPoint()) {
-                return Builder.CreateFPCast(subject, getBoundLLVMType());
-            }
-
-            if (source_type->isIntegral()) {
-                if (source_type->isUnsigned()) {
-                    return Builder.CreateUIToFP(subject, getBoundLLVMType());
-                } else {
-                    return Builder.CreateSIToFP(subject, getBoundLLVMType());
-                }
-            }
-        }
-    } return subject;
-}
-
-
-CGValue Expression::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    assert(expr_type != nullptr);
-    SET_BOUND_TYPE_STATE(expr_type);
-
-    const auto val = expr->llvmCodegen(instance);
-    return val;
-}
-
-
-CGValue Condition::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    const auto parent      = instance.Builder.GetInsertBlock()->getParent();
-    const auto if_block    = llvm::BasicBlock::Create(instance.Context, "if", parent);
-    const auto else_block  = llvm::BasicBlock::Create(instance.Context, "else", parent);
-    const auto merge_block = llvm::BasicBlock::Create(instance.Context, "merge", parent);
-
-    const auto if_cond = bool_expr.llvmCodegen(instance).getRValue(instance);
-    instance.Builder.CreateCondBr(if_cond, if_block, else_block);
-
-    {
-        instance.Builder.SetInsertPoint(if_block);
-        instance.codegenChildrenUntilRet(if_children, if_cond);
-
-        // insert a jump to the merge block if the scope either doesn't end with a
-        // terminator or is empty
-        if (!instance.Builder.GetInsertBlock()->back().isTerminator() ||
-            instance.Builder.GetInsertBlock()->empty())
-            instance.Builder.CreateBr(merge_block);
-    }
-
-    {
-        instance.Builder.SetInsertPoint(else_block);
-
-        for (auto& [condition, children] : elif_children) {
-            const auto cnd = condition.llvmCodegen(instance).getRValue(instance);
-
-            auto elif_block = llvm::BasicBlock::Create(instance.Context, "elif", parent);
-            auto next_elif  = llvm::BasicBlock::Create(instance.Context, "next_elif", parent);
-
-            instance.Builder.CreateCondBr(cnd, elif_block, next_elif);
-            instance.Builder.SetInsertPoint(elif_block);
-            instance.codegenChildrenUntilRet(children, cnd);
-
-            // insert a jump to the merge block if the scope either doesn't end with a
-            // terminator or is empty
-            if (!instance.Builder.GetInsertBlock()->back().isTerminator() ||
-                instance.Builder.GetInsertBlock()->empty())
-                instance.Builder.CreateBr(merge_block);
-
-            instance.Builder.SetInsertPoint(next_elif);
-        }
-
-        instance.codegenChildrenUntilRet(else_children);
-
-        // insert a jump to the merge block if the scope either doesn't end with a
-        // terminator or is empty
-        if (!instance.Builder.GetInsertBlock()->back().isTerminator() ||
-            instance.Builder.GetInsertBlock()->empty())
-            instance.Builder.CreateBr(merge_block);
-
-        instance.Builder.SetInsertPoint(merge_block);
-    }
-
+    Builder.CreateRetVoid();
     return {};
 }
 
 
-CGValue WhileLoop::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    const auto parent = instance.Builder.GetInsertBlock()->getParent();
-    const auto last_inst = instance.Builder.GetInsertBlock()->getTerminator();
-
-    const auto cond_block  = llvm::BasicBlock::Create(instance.Context, "while_cond", parent);
-    const auto body_block  = llvm::BasicBlock::Create(instance.Context, "while_body", parent);
-    const auto merge_block = llvm::BasicBlock::Create(instance.Context, "merge", parent);
-
-    if (last_inst == nullptr)
-        instance.Builder.CreateBr(cond_block);
-
-    instance.Builder.SetInsertPoint(cond_block);
-    const auto expr  = condition.llvmCodegen(instance).getRValue(instance);
-    instance.Builder.CreateCondBr(expr, body_block, merge_block);
-
-    instance.setLoopMetadata({.break_to = merge_block, .continue_to = cond_block});
-
-    {
-        instance.Builder.SetInsertPoint(body_block);
-        instance.codegenChildrenUntilRet(children);
-
-        if (!instance.Builder.GetInsertBlock()->back().isTerminator() ||
-            instance.Builder.GetInsertBlock()->empty())
-        instance.Builder.CreateBr(cond_block);
+CGValue LLVMBackend::llvmCodegen(Struct* node, const SwContext& context) {
+    if (!node->generic_params.empty() && !node->is_monomorphization) {
+        return {};
     }
 
-    instance.restoreLoopMetadata();
-    instance.Builder.SetInsertPoint(merge_block);
-    return {nullptr, nullptr};
-}
-
-
-CGValue BreakStmt::llvmCodegen(LLVMBackend &instance) {
-    instance.Builder.CreateBr(instance.getLoopMetadata().break_to);
-    return {};
-}
-
-CGValue ContinueStmt::llvmCodegen(LLVMBackend &instance) {
-    instance.Builder.CreateBr(instance.getLoopMetadata().continue_to);
-    return {};
-}
-
-CGValue Struct::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    auto struct_sw_ty = instance.SymMan.lookupType(ident);
+    const auto struct_sw_ty = TypeManager.lookupType(node->ident);
     assert(struct_sw_ty);
 
-    instance.setManglingContext({.encapsulator = struct_sw_ty});
-    for (auto& member : members) {
+    for (const auto& member : node->members->children) {
         if (member->getNodeType() == ND_FUNC) {
-            member->llvmCodegen(instance);
+            codegen(member, context);
         }
-    } instance.restoreManglingContext();
+    }
+
     return {};
 }
 
 
-CGValue FuncCall::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
+CGValue LLVMBackend::llvmCodegen(const ProtocolImpl* node, const SwContext& context) {
+    for (Node* member : node->children->children) {
+        if (member->getNodeType() == ND_FUNC) {
+            codegen(member, context);
+        }
+    }
+
+    return {};
+}
+
+
+CGValue LLVMBackend::llvmCodegen(FuncCall* node, const SwContext& context) {
     std::vector<llvm::Type*> paramTypes;
 
-    assert(ident.getIdentInfo());
-    auto fn_name = ident.getIdentInfo();
+    assert(node->ident->getIdentInfo());
+    const auto fn_name = node->ident->getIdentInfo();
 
-    llvm::Function* func = instance.LModule->getFunction(instance.mangleString(fn_name));
+    llvm::Function* func = LModule->getFunction(mangleString(fn_name));
+
     if (!func) {
         [[maybe_unused]] auto fn = llvm::Function::Create(
-            llvm::dyn_cast<llvm::FunctionType>(instance.SymMan.lookupType(ident.getIdentInfo())->llvmCodegen(instance)),
+            llvm::dyn_cast<llvm::FunctionType>(codegen(TypeManager.lookupType(node->ident->getIdentInfo()), context)),
             llvm::GlobalValue::ExternalLinkage,
-            instance.mangleString(fn_name),
-            instance.LModule.get()
+            mangleString(fn_name),
+            LModule.get()
             );
-        func = instance.LModule->getFunction(instance.mangleString(fn_name));
+        func = LModule->getFunction(mangleString(fn_name));
     }
 
     std::vector<llvm::Value*> arguments{};
-    arguments.reserve(args.size() + 1);
+    arguments.reserve(node->args.size() + 1);
 
-    assert(ident.value);
-    auto& entry = instance.SymMan.lookupDecl(ident.value);
-    if ( entry.method_of && !entry.is_static) {
+    assert(node->ident->value);
+    const auto& entry = SymMan.lookupDecl(node->ident->value);
+
+    int8_t bias = 0;
+    if (entry.method_of && !entry.is_static) {
         // push the implicit instance pointer if the callee is a method and not static
-        assert(instance.ComputedPtr);
-        arguments.push_back(instance.ComputedPtr);  // push the ComputedPtr as an implicit argument
+        assert(ComputedPtr);
+        arguments.push_back(ComputedPtr);  // push the ComputedPtr as an implicit argument
+        bias = 1;
     }
 
-    for (auto& item : args)
-        arguments.push_back(item.llvmCodegen(instance).getRValue(instance));
+    // push the function arguments
+    for (const auto& [index, item] : llvm::enumerate(node->args)) {
+        auto new_ctx = context;
+        new_ctx.bound_type =
+            TypeManager.lookupType(node->getIdentInfo())
+                ->to<FunctionType>()->param_types.at(index + bias);
+
+        arguments.push_back(codegen(item, new_ctx).getRValue(*this, new_ctx));
+    }
 
     if (!func->getReturnType()->isVoidTy()) {
-        Type* ret_type = nullptr;
-
-        auto fn_type = dynamic_cast<FunctionType*>(instance.SymMan.lookupType(ident.value));
-        ret_type = fn_type->ret_type;
-
-        auto call = instance.Builder.CreateCall(func, arguments, ident.value->toString());
-
-        return {call, call};
+        auto call = Builder.CreateCall(func, arguments, node->ident->value->toString());
+        return {call, call, TypeManager.lookupType(node->getIdentInfo())->to<FunctionType>()->ret_type};
     }
 
-    instance.Builder.CreateCall(func, arguments);
+    Builder.CreateCall(func, arguments);
     return {};
 }
 
 
-CGValue Var::llvmCodegen(LLVMBackend &instance) {
-    PRE_SETUP();
-    assert(var_type.type != nullptr);
+CGValue LLVMBackend::llvmCodegen(Var* node, const SwContext& context) {
+    if (node->is_comptime) {
+        return {};
+    }
 
-    llvm::Type* type = var_type.type->llvmCodegen(instance);
+    assert(node->var_type->type != nullptr);
+
+    llvm::Type* type = codegen(node->var_type->type, context);
     assert(type != nullptr);
+    assert(!type->isVoidTy());
 
     llvm::Value* init = nullptr;
 
-    auto linkage = (is_exported || is_extern) ?
+    const auto linkage = (node->is_exported || node->is_extern) ?
         llvm::GlobalVariable::ExternalLinkage : llvm::GlobalVariable::InternalLinkage;
 
 
-    if (!instance.isLocalScope()) {
-        auto var_name = is_extern ? var_ident->toString() : instance.mangleString(var_ident);
+    if (!isLocalScope()) {
+        auto var_name = node->is_extern ? node->var_ident->toString() : mangleString(node->var_ident);
         auto* var = new llvm::GlobalVariable(
-                *instance.LModule, type, is_const, linkage,
+                *LModule, type, node->is_const, linkage,
                 nullptr, var_name
                 );
 
-        if (initialized) {
-            instance.BoundMemory = var;
-            init = value.llvmCodegen(instance).getRValue(instance);
+        if (node->initialized) {
+            auto new_ctx = context;
+            new_ctx.bound_memory = var;
+            init = codegen(node->value, new_ctx).getRValue(*this, new_ctx);
             const auto val = llvm::dyn_cast<llvm::Constant>(init);
             assert(val != nullptr);
             var->setInitializer(val);
-            instance.BoundMemory = nullptr;
+        } else if (node->value && node->value->expr == nullptr) {
+            // when the `undefined` keyword isn't used, initialize with 0's
+            var->setInitializer(llvm::Constant::getNullValue(type));
+        } else {
+            // when the `undefined` keyword is used
+            var->setInitializer(llvm::UndefValue::get(type));
         }
 
         // handle references
-        if (var_type.type->getTypeTag() == Type::REFERENCE) {
-            instance.SymMan.lookupDecl(this->var_ident).llvm_value = instance.RefMemory;
-        } else instance.SymMan.lookupDecl(this->var_ident).llvm_value = var;
+        if (node->var_type->type->isReferenceType()) {
+            SymMan.lookupDecl(node->var_ident).llvm_value = RefMemory;
+        } else SymMan.lookupDecl(node->var_ident).llvm_value = var;
     } else {
-        llvm::AllocaInst* var_alloca = instance.Builder.CreateAlloca(
-            type, nullptr, var_ident->toString());
+        llvm::AllocaInst* var_alloca = Builder.CreateAlloca(
+            type, nullptr, node->var_ident->toString());
 
-        if (is_extern)
+        if (node->is_extern)
             return {};
 
-        if (initialized) {
+        if (node->initialized) {
             // instance.BoundMemory = var_alloca;
-            SET_BOUND_TYPE_STATE(var_type.type);
-            init = value.llvmCodegen(instance).getRValue(instance);
+            auto new_ctx = context;
+            new_ctx.bound_type = node->var_type->type;
+            init = codegen(node->value, new_ctx).getRValue(*this, new_ctx);
+
             assert(init != nullptr);
+            Builder.CreateStore(init, var_alloca, node->is_volatile);
 
-            instance.Builder.CreateStore(init, var_alloca, is_volatile);
+        } else if (node->value && node->value->expr == nullptr) {
+            // when the `undefined` keyword isn't used, initialize with 0's
+            Builder.CreateMemSet(
+                var_alloca,
+                toLLVMInt(0, 8),
+                getDataLayout().getTypeAllocSize(type).getFixedValue(),
+                llvm::MaybeAlign());
 
-            instance.BoundMemory = nullptr;
+            // TODO: make the memset inline in freestanding mode ^
         }
 
         // handle references
-        if (var_type.type->getTypeTag() == Type::REFERENCE) {
-            instance.SymMan.lookupDecl(this->var_ident).llvm_value = instance.RefMemory;
-        } else instance.SymMan.lookupDecl(this->var_ident).llvm_value = var_alloca;
+        if (node->var_type->type->isReferenceType()) {
+            SymMan.lookupDecl(node->var_ident).llvm_value = RefMemory;
+        } else SymMan.lookupDecl(node->var_ident).llvm_value = var_alloca;
     }
 
     return {};

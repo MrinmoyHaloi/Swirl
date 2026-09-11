@@ -1,0 +1,205 @@
+#pragma once
+#include <utility>
+
+#include "GenericSubstitutor.h"
+#include "sema/SymbolRegistrationPass.h"
+#include "sema/SymbolResolver.h"
+#include "ast/RecursiveVisitor.h"
+
+
+namespace sw {
+class GenericInstantiator : public RecursiveVisitor<GenericInstantiator> {
+public:
+    explicit GenericInstantiator(Module* module, ErrorCallback_t error_callback)
+        : m_SymMan(module->symbol_table)
+        , m_Module(module)
+        , m_ComptimeEvaluator(module, error_callback)
+        , m_Substitutor(module, m_ComptimeEvaluator)
+        , m_ErrorCallback(std::move(error_callback))
+        , TypeManager(module->type_manager) {}
+
+    TypeManager& TypeManager;
+
+    using SubstitutionMap_t   = GenericSubstitutor::SubstitutionMap_t;
+    using SubstitutionContext = GenericSubstitutor::SubstitutionContext;
+
+    /// Runs symbol registration and symbol resolution passes on the node, returns `nullptr` if errors
+    /// were reported.
+    Node* runPasses(Node* node) {
+        sema::SymbolRegistrationPass reg_pass{{
+                .module = m_Module,
+                .error_callback = m_ErrorCallback,
+                .is_monomorphization = true,
+                .target = m_Module->getTarget()
+            }};
+
+        reg_pass.dispatch(node);
+
+        if (reg_pass.errorsOccurred()) {
+            return nullptr;
+        }
+
+        sema::SymbolResolver resolver{{
+                .module = m_Module,
+                .error_callback = m_ErrorCallback,
+                .is_monomorphization = true,
+                .target = m_Module->getTarget()
+            }};
+
+        resolver.dispatch(node, sema::SymbolResolver::Data{});
+
+        if (resolver.errorsOccurred()) {
+            return nullptr;
+        }
+
+        return node;
+    }
+
+
+    void handle(Ident* ident) {
+        std::vector<Ident::Qualifier> tmp;
+
+        for (auto& [name, generic_args, _] : ident->full_qualification) {
+            tmp.push_back({.name = name});
+
+            if (!generic_args.empty()) {
+                IdentInfo* id = m_SymMan.getIDInfoFor(Ident{tmp});
+                assert(id != nullptr);
+
+                const Node* node = m_SymMan.lookupDecl(id).node_ptr;
+                assert(node != nullptr);
+
+                detail::InstKey inst_key;
+                inst_key.id = id;
+
+                SubstitutionMap_t subst_map;
+                std::string       subst_name = inst_key.id->toString();
+
+                const GlobalNode* target = m_SymMan.lookupDecl(inst_key.id).node_ptr->to<GlobalNode>();
+                assert(target != nullptr);
+
+                // early-return if args and param-size do not match
+                if (target->generic_params.size() != generic_args.size()) {
+                    reportError(
+                        ErrCode::TOO_MANY_GENERIC_ARGS,
+                        {.location = node->location});
+                    return;
+                }
+
+                // --- build the key and map for the instantiation --- //
+                for (auto [arg, param] : std::views::zip(generic_args, target->generic_params)) {
+                    // check whether protocol constraints are satisfied
+                    bool constraints_satisfied = true;
+                    for (const Ident* protocol : param->constraints) {
+                        if (Type* arg_ty = arg->isType() ? arg->getType()->type : arg->getExpr()->expr_type) {
+                            const auto protocol_ty = m_Module->symbol_table.lookupDecl(protocol->value).swirl_type;
+                            assert(protocol_ty->getTypeTag() == Type::PROTOCOL);
+
+                            // report an error if the protocol isn't implemented
+                            if (!m_Module->lookupProtocolImpl(arg_ty, protocol_ty->to<ProtocolConstraint>())) {
+                                reportError(ErrCode::PROTOCOL_NOT_IMPLEMENTED, {
+                                    .str_1 = protocol_ty->toString(),
+                                    .str_2 = arg_ty->toString(),
+                                    .location = arg->location
+                                }); constraints_satisfied = false;
+                            }
+                        }
+                    }
+
+                    // constraints are not satisfied so move on
+                    if (!constraints_satisfied)
+                        continue;
+
+                    if (arg->isExpression()) {
+                        Value expr_value = m_ComptimeEvaluator.evaluate(arg->getExpr(), {});
+                        inst_key.args.emplace_back(expr_value);
+
+                        subst_map.insert({param->name, {expr_value}});
+                        subst_name += expr_value.toString();
+                    }
+
+                    else {
+                        Type* type = arg->getType()->type;
+                        assert(type != nullptr);
+
+                        inst_key.args.emplace_back(type);
+
+                        subst_map.insert({param->name, {type}});
+                        subst_name += type->toString();
+                    } subst_name += '_';
+                }
+
+                // monomorphize the generic and push it to the ast if not already done
+                if (!TypeManager.lookupGenericCache(inst_key)) {
+                    SubstitutionContext ctx;
+                    ctx.map = subst_map;
+                    ctx.substitution_name = subst_name;
+
+                    name = m_Module->getStringPool().internLocked(subst_name);
+
+                    Node* new_node = m_Substitutor.run(node, ctx);
+
+                    assert(new_node->isGlobal());
+                    auto* glob_node = new_node->to<GlobalNode>();
+                    glob_node->is_monomorphization = true;
+                    glob_node->generic_params = {};
+
+                    new_node = runPasses(new_node);
+
+                    if (!new_node) return;
+
+                    // if cache submission fails, discard the result, use the cached item and continue
+                    if (!TypeManager.submitToGenericCache(inst_key, new_node->getIdentInfo())) {
+                        IdentInfo* cached_id = TypeManager.lookupGenericCache(inst_key);
+                        ident->value = cached_id;
+                        ident->has_generic_args = false;
+                        continue;
+                    }
+
+                    m_Module->ast.push_back(new_node);
+                    ident->value = new_node->getIdentInfo();
+                    ident->has_generic_args = false;
+
+                } else {
+                    ident->value = TypeManager.lookupGenericCache(inst_key);
+                    ident->has_generic_args = false;
+                }
+            }
+        }
+    }
+
+
+    void postVisit(TypeWrapper* node) const {
+        if (node->type && node->type->containsGeneric() && node->type_id && node->type_id->value) {
+            Type* new_type = TypeManager.lookupType(node->type_id->value);
+            if (new_type && !new_type->containsGeneric()) {
+                node->type = new_type;
+            }
+        }
+    }
+
+
+    void postVisit(Var* node) {
+        if (node->var_type && node->var_type->type && node->var_ident) {
+            auto& decl = m_SymMan.lookupDecl(node->var_ident);
+            if (decl.swirl_type != node->var_type->type) {
+                decl.swirl_type = node->var_type->type;
+            }
+        }
+    }
+
+
+    void reportError(const ErrCode code, ErrorContext ctx) const {
+        ctx.module = m_Module;
+        m_ErrorCallback(code, ctx);
+    }
+
+
+private:
+    SymbolManager&     m_SymMan;
+    Module*            m_Module;
+    ComptimeEvaluator  m_ComptimeEvaluator;
+    GenericSubstitutor m_Substitutor;
+    ErrorCallback_t    m_ErrorCallback;
+};
+}

@@ -1,31 +1,39 @@
 #pragma once
-#include <print>
 #include <utility>
 #include <filesystem>
 #include <unordered_set>
 
-#include "parser/Parser.h"
+#include "Target.h"
 #include "utils/Threadpool.h"
+#include "utils/logging.h"
 #include "backend/LLVMBackend.h"
 #include "errors/ErrorPipeline.h"
-#include "managers/ModuleManager.h"
+#include "modules/ModuleManager.h"
+#include "utils/FileSystem.h"
+#include "utils/StringPool.h"
+#include "builtins/builtins.h"
+#include "types/TypeManager.h"
 
 
 namespace fs = std::filesystem;
 using ThreadPool = sw::ThreadPool;
 
 
+/// Represents a Compiler Instance used to compile a single Swirl Project. Ensure pointer stability for
+/// the instance of this class.
 class CompilerInst {
-    ThreadPool     m_ThreadPool;
-    ErrorManager   m_ErrorManager;
-    ModuleManager  m_ModuleManager;
+    ThreadPool      m_ThreadPool;
+    ErrorManager    m_ErrorManager;
+    ModuleManager   m_ModuleManager;
+    sw::TypeManager m_TypeManager;
 
-    fs::path      m_SrcPath;
-    fs::path      m_OutputPath;     // path/to/executable (absolute)
-    unsigned      m_BaseThreadCount = std::thread::hardware_concurrency() / 2;
+    fs::path       m_SrcPath;
+    unsigned       m_BaseThreadCount = std::thread::hardware_concurrency() / 2;
 
-    Parser* m_MainModParser = nullptr;
-    ErrorCallback_t         m_ErrorCallback = nullptr;
+    sw::FileSystem m_Filesystem;
+    sw::StringPool m_StringPool;
+
+    ErrorCallback_t m_ErrorCallback = nullptr;
 
     using Backends_t = std::vector<std::unique_ptr<LLVMBackend>>;
 
@@ -39,15 +47,23 @@ class CompilerInst {
     void generateObjectFiles(Backends_t&);
 
     struct PackageInfo;
+    friend struct Module;
 
 public:
     inline static int RecursionDepth = 1024;
-    inline static std::string TargetTriple;
+    inline static sw::Target  Target;
     inline static std::unordered_set<std::string> LinkTargets;
     inline static std::unordered_map<std::string, PackageInfo> PackageTable;
+    inline static fs::path OutputPath; // path/to/executable (absolute)
 
+    inline static bool RunExe = false;
 
-    explicit CompilerInst(fs::path path) : m_SrcPath(std::move(path)) {
+    explicit CompilerInst(fs::path path)
+        : m_TypeManager(m_ModuleManager)
+        , m_SrcPath(std::move(path))
+        , m_StringPool(16 * 1024)
+        , m_ModuleManager(m_StringPool, Target, m_TypeManager)
+    {
         m_ErrorCallback = [this](const ErrCode code, const ErrorContext& ctx) {
             m_ErrorManager.newErrorLocked(code, ctx);
         };
@@ -73,11 +89,20 @@ public:
         setRecursionDepth(std::stoi(str));
     }
 
+    static void setTargetTriple(const std::string_view triple) {
+        Target = sw::Target::fromTriple(triple);
+    }
+
 
     void compile() {
-        if (TargetTriple.empty()) {
-            TargetTriple = llvm::sys::getDefaultTargetTriple();
+        if (!Target.isInitialized()) {
+            Target = sw::Target::fromHostTriple();
         }
+
+        const auto Triple = Target.getTriple();
+
+        // create a virtual file for builtins
+        m_Filesystem.createVirtualFile(SW_BUILTIN_FILE_PATH, SW_BUILTIN_SOURCE);
 
         ErrorPipeline err_pipeline;
         if (m_ErrorManager.m_OutputPipeline == nullptr) {
@@ -85,13 +110,18 @@ public:
             m_ErrorManager.m_OutputPipeline = &err_pipeline;
         }
 
-        m_MainModParser = new Parser(m_SrcPath, m_ErrorCallback, m_ModuleManager);
-        m_MainModParser->toggleIsMainModule();
-        m_ModuleManager.setMainModParser(m_MainModParser);
+        // create a module for the main source file
+        const auto file_handle = m_Filesystem.open(m_SrcPath);
+        const auto main_module = new Module{
+            {file_handle, m_ModuleManager, m_StringPool, Target, m_TypeManager}};
 
-        m_MainModParser->parse();
+        main_module->m_IsMainModule = true;
 
-        // check for parser errors and abort if present
+        // add an entry to the module manager
+        m_ModuleManager.insert(file_handle, main_module);
+        main_module->parse(m_ErrorCallback);
+
+        // check for parser errors and flush if present
         if (m_ErrorManager.errorOccurred()) {
             m_ErrorManager.flush();
         }
@@ -99,16 +129,16 @@ public:
         // || --- *---*   Sema   *---* --- || //
         int batch_no = 1;
         while (!m_ModuleManager.zeroVecIsEmpty()) {
-            std::println("Batch-{}: ", batch_no++);
-
+            SW_LOG_INFO("Batch-{}: ", batch_no);
+            batch_no++;
             while (const auto mod = m_ModuleManager.popZeroDepVec()) {
-                std::print("{}, ", mod->m_FilePath.string());
-                m_ThreadPool.enqueue([mod] {
-                    mod->performSema();
+                SW_LOG_INFO("{}, ", mod->file_handle->getPath().string());
+
+                m_ThreadPool.enqueue([this, mod] {
+                    mod->performSema(m_ErrorCallback);
                 });
             }
 
-            std::println("\n-------------");
             m_ModuleManager.swapBuffers();
             m_ThreadPool.wait();
         } m_ThreadPool.wait();
@@ -125,12 +155,7 @@ public:
 
     /// Parses the string and adds an entry to the package table
     static void addPackageEntry(std::string_view, bool is_project = false);
-
-    static void setTargetTriple(const std::string& triple) { TargetTriple = triple; }
-    static std::string_view getTargetTriple() { return TargetTriple; }
     static void appendLinkTarget(std::string_view target) { LinkTargets.emplace(target); }
-
-    // ~CompilerInst() { m_ThreadPool.shutdown(); }
 };
 
 

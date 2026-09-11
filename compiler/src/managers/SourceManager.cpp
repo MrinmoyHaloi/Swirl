@@ -5,38 +5,25 @@
 
 #include "CompilerInst.h"
 #include "managers/SourceManager.h"
+#include "modules/ModuleManager.h"
+#include "utils/FileSystem.h"
 
 
-using Triple = llvm::Triple;
-#define TargetTriple Triple(CompilerInst::TargetTriple)
-
-#define BuiltInStr std::format(R"(
-comptime platform = "{}";
-comptime arch     = "{}";
-)",                                                                      \
-TargetTriple.getOS() == Triple::Win32 ? "windows"                        \
-    : TargetTriple.getOS() == Triple::Linux ? "linux"                    \
-    : TargetTriple.getOS() == Triple::MacOSX ? "darwin" : "unknown",     \
-                                                                         \
-TargetTriple.getArch() == Triple::x86 ? "x86"                            \
-    : TargetTriple.getArch() == Triple::x86_64 ? "x64"                   \
-    : TargetTriple.getArch() == Triple::aarch64 ? "arm64" : "unknown");
-
-
-SourceManager::SourceManager(const std::filesystem::path& file_path): m_SourcePath(file_path) {
-    std::ifstream file_stream{file_path};
-
+SourceManager::SourceManager(Module* module)
+    : m_SourcePath(module->file_handle->getPath())
+    , m_LineOffsets(module->m_LineOffsets)
+{
     std::size_t pos = 0;
-    m_BuiltInStr = BuiltInStr;
-    m_Source = m_BuiltInStr;
+    const auto stream = std::move(module->file_handle->getStream());
 
-    for (std::string line; std::getline(file_stream, line); ) {
+    for (std::string line; std::getline(*stream, line); ) {
         line += '\n';
         m_LineOffsets.push_back({pos, line.size()});
         m_Source += line;
         pos += line.size();
     }
 }
+
 
 char SourceManager::peek() const {
     return m_Source.at(Pos);
@@ -60,7 +47,7 @@ char SourceManager::next() {
     if (chr == '\n') {
         // line_size = 0;
         m_CurrentLine.clear();
-        if (Pos != m_Source.size() && Pos > m_BuiltInStr.size()) {
+        if (Pos != m_Source.size()) {
             Line++;
         } Col = 0;
 
@@ -75,14 +62,9 @@ char SourceManager::next() {
 
 
 std::string SourceManager::getLineAt(const std::size_t line) const {
-    auto [from, line_size] = m_LineOffsets.at(line - 1);
-    return m_Source.substr(from + m_BuiltInStr.size(), line_size);
+    auto [from, line_size] = m_LineOffsets[line - 1];
+    return m_Source.substr(from, line_size);
 }
-
-std::optional<std::string> SourceManager::getEnumeratedLine(std::size_t at, std::size_t max_line_no) {
-    return {};
-}
-
 
 void SourceManager::reset() {
     Col = Pos = 0; Line = 1;
@@ -107,17 +89,5 @@ StreamState SourceManager::getStreamState() const {
 void SourceManager::setStreamState(const StreamState& to) {
     Pos = to.Pos;
     Col = to.Col;
-    Line = to.Line ; // + m_BuiltInLineSize;
+    Line = to.Line;
 }
-
-
-void SourceManager::switchSource(const std::size_t from, const std::size_t to) {
-    std::string new_source;
-    for (auto i = from; i <= to; i++) {
-        new_source += getLineAt(i);
-    }
-
-    m_Source = std::move(new_source);
-    reset();
-}
-

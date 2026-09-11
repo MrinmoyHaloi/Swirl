@@ -1,0 +1,179 @@
+#pragma once
+
+#include <utility>
+#include <mutex>
+
+#include "parser/Parser.h"
+#include "ast/RecursiveVisitor.h"
+#include "errors/ErrorManager.h"
+#include "modules/ModuleManager.h"
+
+
+#define SEMA_DISABLE_ERROR_CODE(code) \
+    auto GET_UNIQUE_NAME(err_code_disabler) = SemaVisitor<decltype(*this)>::DisableErrorCode(*this, code)
+
+
+namespace sw { class Target; }
+namespace sema {
+struct SemaContext {
+    Module* module{};
+    ErrorCallback_t error_callback{};
+    bool is_monomorphization = false;
+    sw::Target& target;
+};
+
+
+class GlobalCache {
+public:
+    void insert(Node* node) {
+        auto guard = std::lock_guard(m_Mutex);
+        m_VisitedNodes.insert(node);
+    }
+
+    bool contains(Node* node) {
+        auto guard = std::lock_guard(m_Mutex);
+        return m_VisitedNodes.contains(node);
+    }
+
+    void clear() {
+        m_VisitedNodes.clear();
+    }
+
+private:
+    std::mutex m_Mutex;
+    std::unordered_set<Node*> m_VisitedNodes;
+};
+
+
+template <typename Derived>
+class SemaVisitor : public RecursiveVisitor<Derived> {
+protected:
+    explicit
+    SemaVisitor(Module* module, ErrorCallback_t error_callback)
+        : m_Module(module)
+        , m_Callback(std::move(error_callback))
+        , m_StringPool(module->getStringPool())
+        , m_PreviousCallback(module->symbol_table.getErrorCallback())
+    {
+        module->symbol_table.setErrorCallback([this](const ErrCode code, ErrorContext ctx) {
+            reportError(code, std::move(ctx));
+        });
+    }
+
+    ~SemaVisitor() {
+        // restore the previous callback so the symbol table never holds a
+        // reference to a visitor that has already been destroyed
+        m_Module->symbol_table.setErrorCallback(m_PreviousCallback);
+    }
+
+
+    void reportError(const ErrCode code, ErrorContext context) {
+        if (m_DisabledErrorCodes.contains(code))
+            return;
+
+        m_Module->markErroneous();
+
+        m_ErrorOccurred = true;
+        context.module = m_Module;
+
+        if (!context.location.has_value()) {
+            assert(!m_NodeStack.empty());
+            auto* node = m_NodeStack.back();
+
+            if (auto* expr = node->to<Expression>()) {
+                if (expr->expr) {
+                    const auto child_location = expr->expr->location;
+                    const bool has_location =
+                        child_location.from.Line != 0 ||
+                        child_location.from.Col != 0 ||
+                        child_location.from.Pos != 0;
+                    context.location = has_location ? child_location : node->location;
+                } else {
+                    context.location = node->location;
+                }
+            } else {
+                context.location = node->location;
+            }
+        }
+
+        m_Callback(code, std::move(context));
+    }
+
+    friend class RecursiveVisitor<Derived>;
+
+    struct DisableErrorCode {
+        DisableErrorCode(SemaVisitor& instance,  ErrCode code)
+            : m_Instance(instance)
+            , m_ErrorCode(code)
+        {
+            if (!instance.m_DisabledErrorCodes.contains(code)) {
+                m_Instance.m_DisabledErrorCodes.insert(code);
+            }
+        }
+
+        ~DisableErrorCode() {
+            m_Instance.m_DisabledErrorCodes.erase(m_ErrorCode);
+        }
+
+
+    private:
+        SemaVisitor& m_Instance;
+        ErrCode      m_ErrorCode;
+    };
+
+
+    template <typename Nd, typename... Args>
+    Nd* makeNode(Args&&... args) {
+        return m_Module->makeNode<Nd>(std::forward<Args>(args)...);
+    }
+
+    template <typename T>
+    std::span<T> internArray(std::span<T> arr) {
+        return m_Module->internArray<T>(arr);
+    }
+
+    std::string_view internString(const std::string_view str) const {
+        return m_StringPool.internLocked(str);
+    }
+
+public:
+
+    /// Verify that the Sema pass has not broken any contracts
+    bool verify() {
+        // if constexpr (requires (Derived& derived)
+        //     {{ derived.verify() } -> std::same_as<bool>; }) {
+        //     return static_cast<Derived*>(this)->verify();
+        // }
+
+        return true;
+    }
+
+    Module* m_Module;
+
+private:
+    std::vector<Node*> m_NodeStack;
+    ErrorCallback_t    m_Callback;
+    sw::StringPool&    m_StringPool;
+    ErrorCallback_t    m_PreviousCallback;
+
+    std::unordered_set<ErrCode> m_DisabledErrorCodes;
+
+    bool m_ErrorOccurred = false;
+
+    bool preVisitImplHook(Node* node) {
+        m_NodeStack.push_back(node);
+        return true;
+    }
+
+
+    void postVisitImplHook(Node*) {
+        m_NodeStack.pop_back();
+    }
+
+public:
+    bool errorsOccurred() const {
+        return m_ErrorOccurred;
+    }
+
+    friend class RecursiveVisitor<Derived>;
+};}

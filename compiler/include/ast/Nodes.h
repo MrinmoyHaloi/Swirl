@@ -3,40 +3,61 @@
 #include <filesystem>
 #include <stdexcept>
 #include <utility>
+#include <variant>
 #include <vector>
+#include <format>
+#include <ranges>
 #include <span>
 
-#include "Nodes.h"
+#include "SourceLocation.h"
 #include "utils/utils.h"
 #include "lexer/Tokens.h"
-#include "parser/evaluation.h"
+#include "symbols/IdentManager.h"
+#include "types/SwTypes.h"
+#include "utils/FileSystem.h"
 
 
+#define SW_NODE_LIST \
+    SW_NODE(ND_INVALID, Node) \
+    SW_NODE(ND_EXPR, Expression) \
+    SW_NODE(ND_INT, IntLit) \
+    SW_NODE(ND_FLOAT, FloatLit) \
+    SW_NODE(ND_OP, Op) \
+    SW_NODE(ND_VAR, Var) \
+    SW_NODE(ND_STR, StrLit) \
+    SW_NODE(ND_CHAR, CharLit) \
+    SW_NODE(ND_CALL, FuncCall) \
+    SW_NODE(ND_IDENT, Ident) \
+    SW_NODE(ND_FUNC, Function) \
+    SW_NODE(ND_PARAM, Parameter) \
+    SW_NODE(ND_RET, ReturnStatement) \
+    SW_NODE(ND_COND, Condition) \
+    SW_NODE(ND_WHILE, WhileLoop) \
+    SW_NODE(ND_STRUCT, Struct) \
+    SW_NODE(ND_IMPORT, ImportNode) \
+    SW_NODE(ND_ARRAY, ArrayLit) \
+    SW_NODE(ND_TYPE, TypeWrapper) \
+    SW_NODE(ND_BOOL, BoolLit) \
+    SW_NODE(ND_SCOPE, Scope) \
+    SW_NODE(ND_BREAK, BreakStmt) \
+    SW_NODE(ND_CONTINUE, ContinueStmt) \
+    SW_NODE(ND_INTRINSIC, Intrinsic) \
+    SW_NODE(ND_PROTOCOL, Protocol) \
+    SW_NODE(ND_UNDEFINED, UndefinedValue) \
+    SW_NODE(ND_ENUM, Enum) \
+    SW_NODE(ND_GEN_ARG, GenericArg) \
+    SW_NODE(ND_GEN_ARG_LIST, GenericArgList) \
+    SW_NODE(ND_GENERIC_PARAM, GenericParam) \
+    SW_NODE(ND_FOR_LOOP, ForLoop) \
+    SW_NODE(ND_TYPE_ALIAS, TypeAlias) \
+    SW_NODE(ND_PROTOCOL_IMPL, ProtocolImpl)
+
+
+#define SW_NODE(x, y) x,
 enum NodeType {
-    ND_INVALID,     //  0
-    ND_EXPR,        //  1
-    ND_INT,         //  2
-    ND_FLOAT,       //  3
-    ND_OP,          //  4
-    ND_VAR,         //  5
-    ND_STR,         //  6
-    ND_CALL,        //  7
-    ND_IDENT,       //  8
-    ND_FUNC,        //  9
-    ND_RET,         // 10
-    ND_ASSIGN,      // 11
-    ND_COND,        // 12
-    ND_WHILE,       // 13
-    ND_STRUCT,      // 14
-    ND_IMPORT,      // 15
-    ND_ARRAY,       // 16
-    ND_TYPE,        // 17
-    ND_BOOL,        // 18
-    ND_SCOPE,       // 19
-    ND_BREAK,       // 20
-    ND_CONTINUE,    // 21
-    ND_INTRINSIC,   // 22
+    SW_NODE_LIST
 };
+#undef SW_NODE
 
 
 struct Node;
@@ -49,61 +70,25 @@ class Parser;
 class Namespace;
 class IdentInfo;
 class LLVMBackend;
-class AnalysisContext;
-namespace llvm { class Value; }
-
-using SwNode   = std::unique_ptr<Node>;
-using NodesVec = std::vector<SwNode>;
-
-
-struct AnalysisResult {
-    bool       is_erroneous       = false;
-    Type*      deduced_type       = nullptr;
-    Namespace* computed_namespace = nullptr;
-};
-
-
-struct SourceLocation {
-    StreamState from;
-    StreamState to;
-    fs::path    source;
-};
-
-
-class CGValue {
-public:
-    CGValue(): m_LValue(nullptr), m_RValue(nullptr) {}
-    CGValue(llvm::Value* lvalue, llvm::Value* rvalue): m_LValue(lvalue), m_RValue(rvalue) {}
-
-    llvm::Value*   getLValue();
-    llvm::Value*   getRValue(LLVMBackend&);
-
-    static CGValue lValue(llvm::Value* lvalue);
-    static CGValue rValue(llvm::Value* rvalue);
-
-private:
-    llvm::Value* m_LValue;
-    llvm::Value* m_RValue;
-};
 
 
 // The common base class of all the nodes
 struct Node {
     SourceLocation location;
-    std::optional<AnalysisResult> analysis_cache;
-
-    bool is_exported = false;
+    NodeType kind = ND_INVALID;
 
     Node() = default;
-    virtual ~Node() = default;
+    explicit Node(const NodeType ty)
+        : kind(ty) {}
 
+    virtual ~Node() = default;
 
     /// Returns a tag which identifies the node's kind
     [[nodiscard]] virtual NodeType getNodeType() const {
-        return ND_INVALID;
+        return kind;
     }
 
-    /// Can the node allowed to appear in global context (E.g. Functions, Vars)?
+    /// Is the node allowed to appear in global context (E.g. Functions, Vars)?
     [[nodiscard]] virtual bool isGlobal() const {
         return false;
     }
@@ -119,7 +104,7 @@ struct Node {
     }
 
     /// Convenient method to fetch the wrapped-node from an expression
-    virtual SwNode& getExprValue() {
+    virtual Node* getExprValue() {
         throw std::runtime_error("getExprValue called on Node instance");
     }
 
@@ -136,74 +121,63 @@ struct Node {
         throw std::runtime_error("getSwType: unimplemented!");
     }
 
-    virtual std::string toString() const {
-        throw std::runtime_error("Node::toString: not implemented!");
-    }
-
-    virtual void replaceType(std::string_view from, Type* to) {}
-
-    virtual EvalResult evaluate(Parser&);
-    virtual AnalysisResult analyzeSemantics(AnalysisContext&) {
-        return {};
-    }
-
-    virtual CGValue llvmCodegen([[maybe_unused]] LLVMBackend &instance) {
-        throw std::runtime_error("llvmCodegen called on Node instance");
-    }
-
-    virtual SwNode clone() {
-        throw std::runtime_error("clone unimplemented!");
-    }
-
     template <typename From>
     std::add_pointer_t<From> to() {
         return dynamic_cast<std::add_pointer_t<From>>(this);
     }
 };
 
-enum class ErrCode;
-struct ErrorContext;
 
 struct GenericParam final : Node {
-    std::string name;
+    std::string_view  name;
+    IdentInfo*        id;
+    std::span<Ident*> constraints;
+
+    explicit
+    GenericParam() : Node(ND_GENERIC_PARAM), id(nullptr) {}
+
+    [[nodiscard]]
+    NodeType getNodeType() const override {
+        return ND_GENERIC_PARAM;
+    }
 };
 
-struct GlobalNode : Node {
-    bool is_extern   = false;
-    std::string extern_attributes;
 
-    std::vector<GenericParam> generic_params;
+/// Nodes which can appear in the Global Scope inherit from `GlobalNode`.
+struct GlobalNode : Node {
+    std::string_view name;
+
+    std::string_view extern_attributes;
+    std::span<GenericParam*> generic_params;
+
+    bool is_extern   = false;
+    bool is_exported = false;
+    bool is_monomorphization = false;
+
+    explicit GlobalNode(const NodeType ty)
+        : Node(ty) {}
 
     [[nodiscard]]
     bool isGlobal() const override {
         return true;
     }
-
-    virtual std::unique_ptr<Node> instantiate(Parser& instance,
-        std::span<Type*>,
-        std::function<void (ErrCode, ErrorContext)>)
-    {
-        throw std::runtime_error("Generic instantiation unimplemented!");
-    }
 };
 
 
 struct Expression final : Node {
-    SwNode expr;
+    bool is_comptime = false;
+
+    Node* expr = nullptr;
     Type* expr_type = nullptr;
 
-    Expression() = default;
+    explicit Expression(): Node(ND_EXPR) {}
 
-    static Expression makeExpression(std::unique_ptr<Node>&& node) {
+    static Expression makeExpression(Node* node) {
         Expression expr;
-        expr.expr = std::move(node);
+        expr.expr = node;
         return expr;
     }
 
-    static Expression makeExpression(const EvalResult& e);
-    static Expression makeExpression(Node* node) {
-        return makeExpression(std::unique_ptr<Node>(node));
-    }
 
     // set the type of sub-expression instances to `to`
     void setType(Type* to);
@@ -212,7 +186,7 @@ struct Expression final : Node {
         return expr->getIdentInfo();
     }
 
-    [[nodiscard]] SwNode& getExprValue() override {
+    [[nodiscard]] Node* getExprValue() override {
         return expr;
     }
 
@@ -231,32 +205,14 @@ struct Expression final : Node {
     Type* getSwType() override {
         return expr_type;
     }
-
-    std::string toString() const override {
-        return '(' + expr->toString() + ')';
-    }
-
-    void replaceType(const std::string_view from, Type* to) override {
-        expr->replaceType(from, to);
-    }
-
-    SwNode clone() override {
-        auto ret = std::make_unique<Expression>();
-        ret->expr = expr->clone();
-        ret->expr_type = expr_type;
-        return ret;
-    }
-
-    EvalResult     evaluate(Parser&) override;
-    CGValue        llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };
 
 
 struct Op final : Node {
-    std::string value;
     int8_t arity = 2;  // the no. of operands the operator requires
-    std::vector<std::unique_ptr<Node>> operands;  // the operands
+
+    Token::TokenValue tokenid{};
+    std::span<Node*> operands;  // the operands
 
     // for the special case of the `&` operator, where a `mut` can appear right after it
     bool is_mutable = false;
@@ -268,6 +224,8 @@ struct Op final : Node {
         MUL,
         DIV,
         MOD,
+        EXP,
+        EXP_ASSIGN,
 
         UNARY_ADD,
         UNARY_SUB,
@@ -296,16 +254,34 @@ struct Op final : Node {
         DIV_ASSIGN,
         MOD_ASSIGN,
 
+        BITWISE_OR,
+        BITWISE_AND,
+        BITWISE_XOR,
+        BITWISE_NOT,
+        BITWISE_LSHIFT,
+        BITWISE_RSHIFT,
+
+        BITWISE_OR_ASSIGN,
+        BITWISE_AND_ASSIGN,
+        BITWISE_XOR_ASSIGN,
+        BITWISE_LSHIFT_ASSIGN,
+        BITWISE_RSHIFT_ASSIGN,
+
+        ALIGNOF,
+        SIZEOF,
+        TYPEOF,
+
         INVALID
     };
 
     OpTag_t op_type = INVALID;
     Type*  common_type = nullptr;  // the common type of its operands
 
-    Op() = default;
+    explicit Op()
+        : Node(ND_OP) {}
 
-    explicit Op(std::string_view str, int8_t arity);
-    static OpTag_t getTagFor(std::string_view str, int arity);
+    explicit Op(Token::TokenValue tokenid, int8_t arity);
+    static OpTag_t getTagFor(Token::TokenValue tokenid, int arity);
 
     // set the type of sub-expression instances to `to`
     void setType(Type* to) const;
@@ -314,86 +290,47 @@ struct Op final : Node {
     NodeType getNodeType() const override { return ND_OP; }
     Type* getSwType() override { return common_type; }
 
-    [[nodiscard]] SwNode& getLHS() {
+    [[nodiscard]] Node* getLHS() const {
         assert(!operands.empty());
         return operands.at(0);
     }
 
-    [[nodiscard]] SwNode& getRHS() {
+    [[nodiscard]] Node* getRHS() const {
         assert(operands.size() >= 2);
         return operands.at(1);
-    }
-
-    std::string toString() const override {
-        switch (arity) {
-            case 1:
-                return value + operands.at(0)->toString();
-            case 2:
-                return operands.at(0)->toString() + value + operands.at(1)->toString();
-            default: throw std::runtime_error("Op::toString: invalid arity");;
-        }
-    }
-
-    SwNode clone() override {
-        auto ret = std::make_unique<Op>();
-        ret->value = value;
-        ret->arity = arity;
-
-        for (auto& operand : operands) {
-            ret->operands.push_back(operand->clone());
-        }
-
-        ret->is_mutable = is_mutable;
-        ret->op_type = op_type;
-        ret->common_type = common_type;
-        return ret;
     }
 
     static int getLBPFor(OpTag_t op);
     static int getRBPFor(OpTag_t op);
     static int getPBPFor(OpTag_t op);
-
-    void replaceType(std::string_view from, Type* to) override;
-
-    EvalResult     evaluate(Parser& instance) override;
-    CGValue        llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };
 
 
 struct ReturnStatement final : Node {
-    Expression value;
+    Expression* value = nullptr;
     FunctionType* parent_fn_type = nullptr;  // holds the function-signature of the parent
 
-    CGValue llvmCodegen(LLVMBackend &instance) override;
+    explicit
+    ReturnStatement()
+        : Node(ND_RET) {}
 
     [[nodiscard]] NodeType getNodeType() const override {
         return ND_RET;
     }
-
-    std::string toString() const override {
-        return "return " + value.toString();
-    }
-
-    SwNode clone() override {
-        auto ret = std::make_unique<ReturnStatement>();
-        ret->value = std::move(*dynamic_cast<Expression*>(value.clone().get()));
-        ret->parent_fn_type = parent_fn_type;
-        return ret;
-    }
-
-    void replaceType(const std::string_view from, Type* to) override {
-        value.replaceType(from, to);
-    }
-
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };
 
-struct IntLit final : Node {
-    std::string value;
 
-    explicit IntLit(std::string val): value(std::move(val)) {}
-    explicit IntLit(std::size_t val): value(std::to_string(val)) {}
+struct UndefinedValue final : Node {
+    explicit UndefinedValue() : Node(ND_UNDEFINED) {}
+};
+
+
+struct IntLit final : Node {
+    std::string_view value;
+
+    explicit IntLit(const std::string_view val)
+        : Node(ND_INT), value(val) {}
+
 
     [[nodiscard]] NodeType getNodeType() const override {
         return ND_INT;
@@ -402,24 +339,14 @@ struct IntLit final : Node {
     [[nodiscard]] bool isLiteral() const override {
         return true;
     }
-
-    std::string toString() const override { return value; }
-
-    SwNode clone() override {
-        return std::make_unique<IntLit>(value);
-    }
-
-    EvalResult   evaluate(Parser &) override;
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };
 
-struct FloatLit final : Node {
-    std::string value;
 
-    explicit FloatLit(std::string val): value(std::move(val)) {}
-    explicit FloatLit(const double val): value(std::to_string(val)) {}
+struct FloatLit final : Node {
+    std::string_view value;
+
+    explicit FloatLit(const std::string_view val)
+        : Node(ND_FLOAT), value(val) {}
 
     [[nodiscard]] NodeType getNodeType() const override {
         return ND_FLOAT;
@@ -428,22 +355,14 @@ struct FloatLit final : Node {
     [[nodiscard]] bool isLiteral() const override {
         return true;
     }
-
-    std::string toString() const override { return value; }
-    SwNode clone() override {
-        return std::make_unique<FloatLit>(value);
-    }
-
-    EvalResult   evaluate(Parser &) override;
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };
 
 
 struct BoolLit final : Node {
     bool value;
-    explicit BoolLit(const bool is_true) : value(is_true) {}
+
+    explicit BoolLit(const bool is_true)
+        : Node(ND_BOOL), value(is_true) {}
 
     [[nodiscard]] NodeType getNodeType() const override {
         return ND_BOOL;
@@ -452,23 +371,22 @@ struct BoolLit final : Node {
     [[nodiscard]] bool isLiteral() const override {
         return true;
     }
+};
 
-    std::string toString() const override { return value ? "true" : "false"; }
-    SwNode clone() override {
-        return std::make_unique<BoolLit>(value);
-    }
 
-    EvalResult   evaluate(Parser &) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
+struct CharLit final : Node {
+    char value;
+    explicit CharLit(const char val)
+        : Node(ND_CHAR)
+        , value(val) {}
 };
 
 
 struct StrLit final : Node {
-    std::string value;
+    std::string_view value;
 
-    explicit StrLit(std::string  val): value(std::move(val)) {}
+    explicit StrLit(const std::string_view val)
+        : Node(ND_STR), value(val) {}
 
     [[nodiscard]]
     NodeType getNodeType() const override {
@@ -479,39 +397,51 @@ struct StrLit final : Node {
     bool isLiteral() const override {
         return true;
     }
-
-    std::string toString() const override { return value; }
-    SwNode clone() override {
-        return std::make_unique<StrLit>(value);
-    }
-
-    EvalResult   evaluate(Parser&) override;
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };
 
-struct TypeWrapper;
+
+struct GenericArg;
+struct GenericArgList final : Node {
+    std::span<GenericArg*> generic_args;
+    GenericArgList()
+        : Node(ND_GEN_ARG_LIST) {}
+
+    [[nodiscard]] auto front() const   { return generic_args.front(); }
+    [[nodiscard]] auto begin() const   { return generic_args.begin(); }
+    [[nodiscard]] auto end()   const   { return generic_args.end(); }
+
+    [[nodiscard]] auto size()    const { return generic_args.size(); }
+    [[nodiscard]] bool empty()   const { return generic_args.empty(); }
+
+    [[nodiscard]] auto at(const std::size_t i) const { return generic_args.at(i); }
+};
+
+
 struct Ident final : Node {
-private:
-    struct ImplDeleter {
-        void operator()(const TypeWrapper* ptr) const;
-    };
-
     struct Qualifier {
-        std::string name;
-        std::vector<TypeWrapper*> generic_args;
-
-        ~Qualifier();
+        std::string_view name;
+        GenericArgList generic_args;
+        IdentInfo* value = nullptr;  // for partial resolution
     };
 
-public:
+    bool has_generic_args = false;
     IdentInfo* value = nullptr;
-    std::vector<Qualifier> full_qualification;
+    std::span<Qualifier> full_qualification;
 
-    Ident() = default;
+    // to keep pre-computed generic instantiation steps to avoid repetitive looping
+    std::unordered_map<Type*, Type*> type_instantiation_map;
 
-    explicit Ident(IdentInfo* val): value(val) {}
+    explicit Ident()
+        : Node(ND_IDENT) {}
+
+    explicit Ident(IdentInfo* val)
+        : Ident() { value = val; }
+
+    /// Convenience constructor for the creation of temporary objects, not to be used for
+    /// the construction of AST nodes
+    explicit Ident(const std::span<Qualifier> full_qualification)
+        : full_qualification(full_qualification) {}
+
 
     IdentInfo* getIdentInfo() override {
         return value;
@@ -525,40 +455,40 @@ public:
         return this;
     }
 
-    std::string toString() const override {
+    [[nodiscard]]
+    std::string toString() const {
         std::string ret;
-        for (auto& id : full_qualification) {
-            ret += id.name + "::";
+        for (const auto& qual : full_qualification) {
+            ret += std::string(qual.name) + "::";
         } ret.pop_back();
-          ret.pop_back();
+        ret.pop_back();
         return ret;
     }
-
-    void replaceType(std::string_view from, Type* to) override;
-
-    EvalResult     evaluate(Parser&) override;
-    CGValue        llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };
 
 
 /// Encodes all the necessary information needed to get a `Type*`.
 struct TypeWrapper final : Node {
+    using ArraySize_t = std::variant<std::monostate, Node*, std::size_t>;
+
     enum Modifiers { Reference, Pointer };
     Type* type = nullptr;
 
-    bool   is_mutable    = false;
-    bool   is_slice      = false;
+    bool    is_mutable    = false;
+    bool    is_slice      = false;
+    bool    is_pointer    = false;
+    bool    is_reference  = false;
 
-    Ident  type_id{};
+    Ident*  type_id  = nullptr;
 
-    std::vector<Modifiers> modifiers{};
-    std::size_t array_size = 0;            // 0 indicates that the type isn't an array
-    std::unique_ptr<TypeWrapper> of_type{};  // set in the case of wrapper types (refs, ptr, arrays, slices)
+    Expression* array_size{};   // set if the type is an array
+    TypeWrapper* of_type{};     // set in the case of wrapper types (refs, ptr, arrays, slices)
 
+    explicit TypeWrapper()
+        : Node(ND_TYPE) {}
 
-    TypeWrapper() = default;
-    explicit TypeWrapper(Type* ty): type(ty) {}
+    explicit TypeWrapper(Type* ty)
+        : Node(ND_TYPE), type(ty) {}
 
     [[nodiscard]]
     Type* getSwType() override {
@@ -569,51 +499,73 @@ struct TypeWrapper final : Node {
     NodeType getNodeType() const override {
         return ND_TYPE;
     }
+};
 
-    void replaceType(const std::string_view from, Type* to) override {
-        if (!type_id.full_qualification.empty()) {
-            if (type_id.full_qualification.front().name == from) {
-                type = to;
-            }
-        } if (of_type) {
-            of_type->replaceType(from, to);
-        }
+
+struct TypeAlias final : Node {
+    std::string_view alias;
+
+    IdentInfo*   ident     = nullptr;
+    TypeWrapper* alias_for = nullptr;
+
+    TypeAlias()
+        : Node(ND_TYPE_ALIAS) {}
+
+    [[nodiscard]] NodeType getNodeType() const override { return ND_TYPE_ALIAS; }
+};
+
+
+struct GenericArg final : Node {
+    explicit GenericArg(): Node(ND_GEN_ARG) {}
+
+    explicit GenericArg(Expression* expr)
+        : GenericArg() { value = expr; }
+
+    explicit GenericArg(TypeWrapper* ty)
+        : GenericArg() { value = ty; }
+
+
+    [[nodiscard]]
+    bool isType() const {
+        return std::holds_alternative<TypeWrapper*>(value);
     }
 
-    // std::unique_ptr<TypeWrapper, Ident::ImplDeleter> clone() {
-    //     auto copy = new TypeWrapper();
-    //     copy->type = type;
-    //     copy->is_mutable = is_mutable;
-    //     copy->type_id = type_id;
-    //     copy->is_slice = is_slice;
-    //     copy->modifiers = modifiers;
-    //     copy->array_size = array_size;
-//
-    //     if (of_type) {
-    //         copy->of_type = of_type->clone();
-    //     } return std::unique_ptr<TypeWrapper, Ident::ImplDeleter>(copy);
-    // }
+    [[nodiscard]]
+    bool isEmpty() const {
+        return std::holds_alternative<std::monostate>(value);
+    }
 
-    std::string toString() const override;
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
+    [[nodiscard]]
+    bool isExpression() const {
+        return std::holds_alternative<Expression*>(value);
+    }
+
+    Expression* getExpr() const {
+        return std::get<Expression*>(value);
+    }
+
+    TypeWrapper* getType() const {
+        return std::get<TypeWrapper*>(value);
+    }
+
+
+private:
+    std::variant<std::monostate, Expression*, TypeWrapper*> value;
 };
+
 
 struct Var final : GlobalNode {
     IdentInfo* var_ident = nullptr;
-    TypeWrapper var_type;
+    TypeWrapper* var_type = nullptr;
 
-    Expression value;
-    Node* parent = nullptr;
+    Expression* value = nullptr;
 
     bool initialized = false;
     bool is_const    = false;
     bool is_volatile = false;
     bool is_comptime = false;
-    bool is_param    = false;
-    bool is_instance_param = false;   // for the special case of `&self` in methods
 
-    Var() = default;
+    explicit Var(): GlobalNode(ND_VAR) {}
 
     [[nodiscard]] NodeType getNodeType()  const override { return ND_VAR; }
 
@@ -621,42 +573,53 @@ struct Var final : GlobalNode {
         return var_ident;
     }
 
-    void replaceType(const std::string_view from, Type* to) override {
-        var_type.replaceType(from, to);
-        value.replaceType(from, to);
-    }
-
-    [[nodiscard]] SwNode& getExprValue() override { return value.expr; }
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
+    [[nodiscard]] Node* getExprValue() override { return value->expr; }
 };
 
+
 struct Scope final : Node {
-    std::vector<SwNode> children;
+    Scope*     parent_scope = nullptr;
+    Namespace* symbols = nullptr;
+
+    std::span<Node*> children;
+
+    explicit Scope()
+        : Node(ND_SCOPE) {}
 
     [[nodiscard]] NodeType getNodeType() const override {
         return ND_SCOPE;
     }
+};
 
-    void replaceType(const std::string_view from, Type* to) override {
-        for (const auto& child : children) {
-            child->replaceType(from, to);
-        }
-    }
 
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
+struct Parameter final : Node {
+    IdentInfo*       ident = nullptr;
+    TypeWrapper*     type = nullptr;
+
+    std::string_view name{};
+    Expression*      value = nullptr;
+
+    bool is_const          = false;
+    bool is_variadic       = false;
+    bool is_instance_param = false;
+    bool is_initialized    = false;
+
+    Parameter()
+        : Node(ND_PARAM) {}
 };
 
 
 struct Function final : GlobalNode {
+    bool is_static_method = true;
     IdentInfo* ident = nullptr;
 
-    std::vector<Var> params;
-    std::vector<std::unique_ptr<Node>> children;
+    Scope* children = nullptr;
+    std::span<Parameter*>  params;
 
-    TypeWrapper return_type;
+    TypeWrapper* return_type = nullptr;
+
+    explicit Function()
+        : GlobalNode(ND_FUNC) {}
 
     IdentInfo* getIdentInfo() override {
         return ident;
@@ -665,33 +628,21 @@ struct Function final : GlobalNode {
     [[nodiscard]] NodeType getNodeType() const override {
         return ND_FUNC;
     }
-
-    void replaceType(const std::string_view from, Type* to) override {
-        for (auto& param : params) {
-            param.replaceType(from, to);
-        }
-
-        return_type.replaceType(from, to);
-        for (const auto& child : children) {
-            child->replaceType(from, to);
-        }
-    }
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
-    std::unique_ptr<Node> instantiate(Parser&, std::span<Type*>, std::function<void (ErrCode, ErrorContext)>) override;
 };
 
 
-struct FuncCall : Node {
-    Ident ident;
-    Type* signature = nullptr;  // supposed to hold the signature of the callee
+struct FuncCall final : Node {
+    Ident* ident     = nullptr;
+    Type*  signature = nullptr;  // supposed to hold the signature of the callee
 
-    std::vector<Expression> args;
-    std::vector<TypeWrapper> generic_args;
+    std::span<Expression*> args;
+    GenericArgList         generic_args;
+
+    explicit FuncCall()
+        : Node(ND_CALL) {}
 
     IdentInfo* getIdentInfo() override {
-        return ident.getIdentInfo();
+        return ident->getIdentInfo();
     }
 
     Type* getSwType() override {
@@ -699,23 +650,10 @@ struct FuncCall : Node {
     }
 
     [[nodiscard]] Ident* getIdent() override {
-        return &ident;
+        return ident;
     }
 
-    [[nodiscard]] NodeType     getNodeType() const override { return ND_CALL; }
-
-    void replaceType(const std::string_view from, Type* to) override {
-        for (auto& ty : generic_args) {
-            ty.replaceType(from, to);
-        }
-
-        for (auto& val : args) {
-            val.replaceType(from, to);
-        }
-    }
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
+    [[nodiscard]] NodeType getNodeType() const override { return ND_CALL; }
 };
 
 
@@ -723,60 +661,56 @@ struct Intrinsic final : Node {
     enum Kind { INVALID, SIZEOF, TYPEOF, MEMCPY, MEMSET, ADV_PTR };
     Kind intrinsic_type = INVALID;
 
-    std::vector<Expression> args;
-    Ident ident;
+    std::span<Expression*> args;
+    Ident* ident = nullptr;
 
-    Intrinsic() = default;
-    void operator=(const std::unique_ptr<FuncCall>& call) {
-        args  = std::move(call->args);
-        ident = std::move(call->ident);
+    explicit Intrinsic()
+        : Node(ND_INTRINSIC) {}
 
-        static const std::unordered_map<std::string, Kind> tag_map = {
+    void operator=(const FuncCall* call) {
+        args  = call->args;
+        ident = call->ident;
+
+        static const std::unordered_map<std::string_view, Kind> tag_map = {
             {"sizeof", SIZEOF},
             {"typeof", TYPEOF},
             {"memset", MEMSET},
             {"memcpy", MEMCPY},
             {"advance_pointer", ADV_PTR}
-        }; intrinsic_type = tag_map.at(ident.full_qualification.at(0).name);
+        }; intrinsic_type = tag_map.at(ident->full_qualification.at(0).name);
     }
 
     [[nodiscard]] NodeType getNodeType() const override { return ND_INTRINSIC; }
-
-    void replaceType(const std::string_view from, Type* to) override {
-        for (auto& arg : args) {
-            arg.replaceType(from, to);
-        }
-    }
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };
 
 
-struct ImportNode final : Node {
+struct ImportNode final : GlobalNode {
     struct ImportedSymbol_t {
-        std::string actual_name;
-        std::string assigned_alias{};
+        std::string_view actual_name;
+        std::string_view assigned_alias;
     };
 
     bool is_wildcard = false;
 
-    std::filesystem::path         mod_path;
-    std::string                   alias;
-    std::vector<ImportedSymbol_t> imported_symbols;
+    sw::FileHandle*  mod_handle = nullptr;
+    std::string_view alias;
+    std::span<ImportedSymbol_t> imported_symbols{};
+
+    explicit ImportNode()
+        : GlobalNode(ND_IMPORT) {}
 
     [[nodiscard]] NodeType getNodeType() const override {
         return ND_IMPORT;
     }
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };
 
 
 struct ArrayLit final : Node {
     Type* type = nullptr;
-    std::vector<Expression> elements;
+    std::span<Expression*> elements;
+
+    explicit ArrayLit()
+        : Node(ND_ARRAY) {}
 
     Type* getSwType() override {
         return type;
@@ -786,116 +720,120 @@ struct ArrayLit final : Node {
     bool isLiteral() const override {
         return true;
     }
-
-    void replaceType(const std::string_view from, Type* to) override {
-        for (auto& element : elements) {
-            element.replaceType(from, to);
-        }
-    }
-
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
-    CGValue llvmCodegen(LLVMBackend &instance) override;
 };
 
 
 struct WhileLoop final : Node {
-    Expression condition;
-    std::vector<std::unique_ptr<Node>> children{};
+    Expression* condition = nullptr;
+    Scope* children = nullptr;
+
+    explicit WhileLoop()
+        : Node(ND_WHILE) {}
 
     [[nodiscard]] NodeType getNodeType() const override {
         return ND_WHILE;
     }
-
-    void replaceType(const std::string_view from, Type* to) override {
-        condition.replaceType(from, to);
-        for (const auto& child : children) {
-            child->replaceType(from, to);
-        }
-    }
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };
 
 
 struct BreakStmt final : Node {
-    CGValue llvmCodegen(LLVMBackend &instance) override;
+    explicit BreakStmt(): Node(ND_BREAK) {}
+
     [[nodiscard]] NodeType getNodeType() const override { return ND_BREAK;}
 };
 
+
 struct ContinueStmt final : Node {
-    CGValue llvmCodegen(LLVMBackend &instance) override;
+    explicit ContinueStmt(): Node(ND_CONTINUE) {}
+
     [[nodiscard]] NodeType getNodeType() const override { return ND_CONTINUE; }
 };
 
 
-struct Protocol final : GlobalNode {
-    struct MethodSignature {
-        std::string name;
-        TypeWrapper return_type;
-        std::vector<TypeWrapper> params;
+struct Enum final : GlobalNode {
+    IdentInfo* ident;
 
-        std::string toString() const {
-            std::string ret =  "fn " + name + "(";
-            for (auto& param : params) {
-                ret += param.toString();
-            } ret += "): " + return_type.toString();
-            return ret;
-        }
+    std::optional<TypeWrapper*> enum_type;
+    std::unordered_map<std::string_view, int> entries;
+
+    explicit Enum()
+        : GlobalNode(ND_ENUM)
+        , ident(nullptr) {}
+
+    int counter = 0;
+    void addEntry(const std::string_view id) {
+        entries.emplace(id, counter++);
+    }
+};
+
+
+struct Protocol final : GlobalNode {
+    template <bool keep_dynamic = false>
+    struct MethodSignature {
+        std::string_view        name;
+        TypeWrapper*            return_type{};
+
+        // true if the method's first parameter is an instance parameter (`&self`).
+        // in that case the first element of `params` is a placeholder (nullptr)
+        // whose type is resolved to a reference of the implementing type during
+        // conformance checking
+        bool is_instance_method = false;
+
+        std::conditional_t<keep_dynamic,
+            std::vector<TypeWrapper*>,
+            std::span<TypeWrapper*>> params{};
 
         bool operator==(const MethodSignature& other) const {
-            return name == other.name && other.return_type.type == return_type.type &&
-                std::equal(params.begin(), params.end(),
-                    other.params.begin(), other.params.end(),
-                    [](const TypeWrapper& a, const TypeWrapper& b) {
-                        return a.type == b.type;
-                    });
+            if (name != other.name || is_instance_method != other.is_instance_method) return false;
+            if ((return_type && other.return_type) ? return_type->type != other.return_type->type
+                                                  : return_type != other.return_type) return false;
+
+            return std::equal(params.begin(), params.end(),
+                other.params.begin(), other.params.end(),
+                [](const TypeWrapper* a, const TypeWrapper* b) {
+                    if (!a || !b) return a == b;
+                    return a->type == b->type;
+                });
         }
 
-        void replaceType(const std::string_view from, Type* to) {
-            return_type.replaceType(from, to);
-            for (auto& ty : params) {
-                ty.replaceType(from, to);
-            }
+        operator MethodSignature<true>() const {
+            MethodSignature<true> result;
+            result.name = name;
+            result.return_type = return_type;
+
+            for (auto ty : params) {
+                result.params.push_back(ty);
+            } return result;
         }
-    };
 
-    struct MemberSignature {
-        std::string  name;
-        TypeWrapper  type{};
-
+        [[nodiscard]]
         std::string toString() const {
-            return name + ": " + type.toString();
-        }
+            std::string res = std::format("fn {}(", name);
+            for (const TypeWrapper* ty : params) {
+                res += "_: " + (ty ? (ty->type ? ty->type->toString() : "???") : "self");
+                res += ',';
+            }
 
-        bool operator==(const MemberSignature& other) const {
-            return name == other.name && other.type.type == type.type;
-        }
-
-        void replaceType(const std::string_view from, Type* to) {
-            type.replaceType(from, to);
+            res += "): " + (return_type->type ? return_type->type->toString() : "???");
+            return res;
         }
     };
 
-    std::string protocol_name;
-    IdentInfo*  protocol_id = nullptr;
+    IdentInfo*  ident = nullptr;
 
-    std::vector<Ident> depended_protocols;
-    std::vector<MemberSignature> members;
-    std::vector<MethodSignature> methods;
+    std::span<Ident*> dependencies;
+    std::span<MethodSignature<>> methods;
+    std::span<TypeAlias*> type_aliases;
 
-    void replaceType(const std::string_view from, Type* to) override {
-        for (auto& member : members) {
-            member.replaceType(from, to);
-        }
-
-        for (auto& method : methods) {
-            method.replaceType(from, to);
-        }
+    IdentInfo* getIdentInfo() override {
+        return ident;
     }
 
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
-    CGValue llvmCodegen(LLVMBackend &instance) override { return {}; }
+    explicit Protocol()
+        : GlobalNode(ND_PROTOCOL) {}
+
+    [[nodiscard]]
+    NodeType getNodeType() const override { return ND_PROTOCOL; }
 };
 
 
@@ -906,34 +844,81 @@ struct std::hash<TypeWrapper> {
     }
 };
 
-template <>
-struct std::hash<Protocol::MemberSignature> {
-    std::size_t operator()(const Protocol::MemberSignature& m) const noexcept {
-        return combineHashes(std::hash<std::string>{}(m.name), std::hash<TypeWrapper>{}(m.type));
-    }
-};
 
 template <>
-struct std::hash<Protocol::MethodSignature> {
-    std::size_t operator()(const Protocol::MethodSignature& m) const noexcept {
+struct std::hash<Protocol::MethodSignature<>> {
+    std::size_t operator()(const Protocol::MethodSignature<>& m) const noexcept {
         std::size_t arg_hash = 0;
         for (auto& arg : m.params) {
-            arg_hash = combineHashes(arg_hash, std::hash<TypeWrapper>{}(arg));
+            arg_hash = combineHashes(arg_hash, std::hash<TypeWrapper*>{}(arg));
         }
 
         return combineHashes(
-            std::hash<std::string>{}(m.name),
-            std::hash<TypeWrapper>{}(m.return_type),
+            std::hash<const char*>{}(m.name.data()),
+            std::hash<TypeWrapper*>{}(m.return_type),
             arg_hash
             );
     }
 };
 
 
+template <>
+struct std::hash<Protocol::MethodSignature<true>> {
+    std::size_t operator()(const Protocol::MethodSignature<true>& m) const noexcept {
+        std::size_t arg_hash = 0;
+        for (auto& arg : m.params) {
+            arg_hash = combineHashes(arg_hash, std::hash<TypeWrapper*>{}(arg));
+        }
+
+        return combineHashes(
+            std::hash<const char*>{}(m.name.data()),
+            std::hash<TypeWrapper*>{}(m.return_type),
+            arg_hash
+            );
+    }
+};
+
+
+struct ProtocolImpl final : GlobalNode {
+    Ident*       protocol = nullptr;
+    TypeWrapper* impl_for = nullptr;
+    Scope*       children = nullptr;
+
+    std::span<TypeAlias*> type_aliases;
+
+    ProtocolImpl(): GlobalNode(ND_PROTOCOL_IMPL) {}
+
+    [[nodiscard]]
+    TypeWrapper* getAliasTypeFor(const std::string_view name) const {
+        for (const TypeAlias* alias : type_aliases) {
+            if (alias->alias == name)
+                return alias->alias_for;
+        } return nullptr;
+    }
+};
+
+
+struct ForLoop final : Node {
+    ForLoop(): Node(ND_FOR_LOOP) {}
+
+    IdentInfo*       loop_var_id   = nullptr;
+    TypeWrapper*     loop_var_type = nullptr;
+    std::string_view loop_var_name{};
+
+    Expression* iterable = nullptr;
+    Scope*      children = nullptr;
+
+    bool        is_comptime = false;
+};
+
+
 struct Struct final : GlobalNode {
-    IdentInfo* ident = nullptr;
-    std::vector<std::unique_ptr<Node>> members;
-    std::vector<Ident> protocols;
+    IdentInfo* ident   = nullptr;
+    Scope*     members = nullptr;
+
+    std::span<Ident*>  protocols;
+
+    explicit Struct() : GlobalNode(ND_STRUCT) {}
 
     [[nodiscard]] NodeType getNodeType() const override {
         return ND_STRUCT;
@@ -942,53 +927,28 @@ struct Struct final : GlobalNode {
     IdentInfo* getIdentInfo() override {
         return ident;
     }
-
-    void replaceType(const std::string_view from, Type* to) override {
-        for (auto& member : members) {
-            member->replaceType(from, to);
-        }
-    }
-
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
-    CGValue llvmCodegen(LLVMBackend &instance) override;
 };
 
 
 struct Condition final : Node {
-    Expression bool_expr;
-    bool       is_comptime = false;
+    bool        is_comptime = false;
+    Expression* bool_expr = nullptr;
 
-    std::vector<std::unique_ptr<Node>> if_children{};
-    std::vector<std::tuple<Expression, std::vector<std::unique_ptr<Node>>>> elif_children;
-    std::vector<std::unique_ptr<Node>> else_children{};
+    using elif_t = std::tuple<Expression*, Scope*>;
 
-    [[nodiscard]] SwNode& getExprValue() override {
-        return bool_expr.expr;
+    Scope*  if_children{};
+    std::span<elif_t> elif_children{};
+    Scope*  else_children{};
+
+    explicit Condition()
+        : Node(ND_COND) {}
+
+
+    [[nodiscard]] Node* getExprValue() override {
+        return bool_expr->expr;
     }
-
 
     [[nodiscard]] NodeType getNodeType() const override {
         return ND_COND;
     }
-
-    void replaceType(const std::string_view from, Type* to) override {
-        bool_expr.replaceType(from, to);
-        for (const auto& child : else_children) {
-            child->replaceType(from, to);
-        }
-
-        for (const auto& child : if_children) {
-            child->replaceType(from, to);
-        }
-
-        for (auto& child : elif_children) {
-            std::get<0>(child).replaceType(from, to);
-            for (auto& c : std::get<1>(child)) {
-                c->replaceType(from, to);
-            }
-        }
-    }
-
-    CGValue llvmCodegen(LLVMBackend &instance) override;
-    AnalysisResult analyzeSemantics(AnalysisContext&) override;
 };

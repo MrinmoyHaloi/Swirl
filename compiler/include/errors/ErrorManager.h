@@ -2,12 +2,14 @@
 #include <mutex>
 #include <optional>
 #include <filesystem>
+#include <functional>
 
-#include "ast/Nodes.h"
+#include "ast/SourceLocation.h"
 
 
 struct Type;
 struct Node;
+struct Module;
 class IdentInfo;
 class SourceManager;
 class ErrorPipeline;
@@ -22,11 +24,11 @@ struct ErrorContext {
     std::filesystem::path path_2{};
 
     std::string msg{};    // optional error-message, used to convey various syntax errors
-    std::string str_1{};
-    std::string str_2{};
+    std::string_view str_1{};
+    std::string_view str_2{};
     std::optional<SourceLocation> location = std::nullopt;
 
-    SourceManager* src_man = nullptr;
+    Module* module = nullptr;
     std::unordered_map<IdentInfo*, Node*>* decl_table = nullptr;
 };
 
@@ -42,20 +44,30 @@ enum class ErrCode {
 
     // The following error codes are related to types, `type_1` and/or `type_2` shall be set to give context
     // about the types involves
-    NO_SUCH_TYPE,             // when the type can't be resolved
-    INCOMPATIBLE_TYPES,       // non-specific
-    NO_IMPLICIT_CONVERSION,   // non-specific catch-all for the edgy implicit-conversion cases
-    INT_AND_FLOAT_CONV,       // no implicit integral-floating conversions
-    NO_NARROWING_CONVERSION,  // narrowing conversions not allowed
-    NO_SIGNED_UNSIGNED_CONV,  // signed-unsigned conversions shall be explicit
-    DISTINCTLY_SIZED_ARR,     // arrays of distinct sizes are incompatible
-    CANNOT_ASSIGN_TO_CONST,   // attempt to re-assign a const
-    IMMUTABILITY_VIOLATION,   // when immutability rules are violated
-    SLICE_NOT_COMPATIBLE,     // when slice types are not compatible with each other
-    NOT_DEREFERENCE_ABLE,     // type cannot be dereferenced,
-    NO_SUCH_PROTOCOL,         // the protocol does not exist
-    PROTOCOL_NOT_SATISFIED,   // the protocol hasn't been satisfied
-    // ----------*----------- //
+    NO_SUCH_TYPE,                // when the type can't be resolved
+    NOT_CALLABLE,                // the object is not a callable
+    INCOMPATIBLE_TYPES,          // non-specific
+    NO_IMPLICIT_CONVERSION,      // non-specific catch-all for the edgy implicit-conversion cases
+    INT_AND_FLOAT_CONV,          // no implicit integral-floating conversions
+    NO_NARROWING_CONVERSION,     // narrowing conversions not allowed
+    NO_SIGNED_UNSIGNED_CONV,     // signed-unsigned conversions shall be explicit
+    DISTINCTLY_SIZED_ARR,        // arrays of distinct sizes are incompatible
+    CANNOT_ASSIGN_TO_CONST,      // attempt to re-assign a const
+    IMMUTABILITY_VIOLATION,      // when immutability rules are violated
+    SLICE_NOT_COMPATIBLE,        // when slice types are not compatible with each other
+    NOT_DEREFERENCE_ABLE,        // type cannot be dereferenced,
+    NO_SUCH_PROTOCOL,            // the protocol does not exist
+    DEPENDENCY_PROTOCOL_MISSING, // a dependency protocol was not implemented
+    TYPE_ALIAS_REQUIRED,         // when a type alias definition is mandated by the protocol
+    PROTOCOL_VIOLATED,           // the protocol hasn't been satisfied (a required method is missing)
+    PROTOCOL_METHOD_MISMATCH,    // an implemented method's signature doesn't satisfy the protocol
+    DUPLICATE_PROTO_IMPL,        // the protocol impl already exists
+    PROTO_IMPL_NOT_EXPORTED,     // the protocol impl exists but not exported
+    PROTOCOL_NOT_IMPLEMENTED,    // the type does not implement the protocol
+    ENUM_TYPE_NOT_INTEGRAL,      // enum types should be integral
+    ONLY_INTEGRAL_BITWISE,       // only integral bitwise operands are allowed in bitwise operators
+    EXPONENTIAL_RHS_INTEGRAL,    // exponential operator's rhs must be of an integral type
+    // ----------*-------------- //
 
 
     // The following error codes are related to the Module System, `path_1`, `path_2` and `str_1` shall be
@@ -78,13 +90,20 @@ enum class ErrCode {
 
 
     TOO_FEW_ARGS,
+    NOT_ENOUGH_ARGS,
+    CONDITION_NOT_BOOL,
+    TOO_MANY_GENERIC_ARGS,
+    NOT_A_GENERIC,
     NON_INTEGRAL_INDICES,
     INDEX_OUT_OF_BOUNDS,
     NON_INT_ARRAY_SIZE,
+    EXTERN_CANNOT_HAVE_BODY,   // when a body is provided for external constructs
     INITIALIZER_REQUIRED,      // when initialization is required but not given
     RET_TYPE_REQUIRED,         // when explicitly specifying a return-type is required (e.g. recursive calls)
     QUALIFIER_UNDEFINED,
     NO_SUCH_MEMBER,
+    AMBIGUOUS_MEMBER,          // a member exists in more than one scope (e.g. a type and its protocol impls)
+    NO_INSTANCE_PARAM_HERE,    // when an instance parameter appears in the wrong context
     MAIN_REDEFINED,            // when the main function is redefined
     CONFIG_VAR_UNINITIALIZED,  // a config-variable is left uninitialized
     CONFIG_INIT_NOT_LITERAL,   // a config variable is initialized with a non-literal
@@ -92,6 +111,11 @@ enum class ErrCode {
     NOT_ALLOWED_CT_CTX,        // when a construct isn't allowed in compile-time evaluated context
     NOT_A_CT_VAR,              // referenced ID is not of a comptime var
     OP_NOT_ALLOWED_HERE,       // when an operator isn't allowed in a context
+    CHAR_LIT_TOO_LONG,         // when a character literal has more than 1 chars
+    CHAR_LIT_EMPTY,            // char literals cannot be empty
+    PARAM_MUST_HAVE_TYPE,      // non variadic params must have a type
+    VARIADIC_AT_END,           // variadic parameters must be at the end
+    ONLY_ONE_VARIADIC,         // there should be no consecutive variadics
 };
 
 

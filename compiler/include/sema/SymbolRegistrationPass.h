@@ -1,0 +1,331 @@
+#pragma once
+#include "SemaVisitor.h"
+#include "types/TypeManager.h"
+#include "verifiers/SymbolRegistration.h"
+
+
+namespace sema {
+class SymbolRegistrationPass : public SemaVisitor<SymbolRegistrationPass> {
+public:
+    explicit
+    SymbolRegistrationPass(const SemaContext& context)
+        : SemaVisitor(context.module, context.error_callback)
+        , SymMan(context.module->symbol_table)
+        , TypeManger(context.module->type_manager) {}
+
+
+    // The scope being nullptr => the current scope is global
+    std::vector<Scope*>      ScopeStack    { nullptr };
+    std::vector<StructType*> StructStack   { nullptr };
+    std::vector<Function*>   FunctionStack { nullptr };
+
+    // asks the immediate scope to use this namespace instead
+    Namespace* PreCreatedScope = nullptr;
+
+    SymbolManager&   SymMan;
+    sw::TypeManager& TypeManger;
+
+    void handle(Scope* node) {
+        assert(!ScopeStack.empty());
+        node->parent_scope = ScopeStack.back();
+
+        if (!PreCreatedScope) {
+            ScopeStack.push_back(node);
+
+            if (!node->symbols)
+                node->symbols = SymMan.newScope();
+
+            if (StructStack.back() && !StructStack.back()->scope) {
+                StructStack.back()->scope = node->symbols;
+                SymMan.lookupDecl(StructStack.back()->ident).scope = node->symbols;
+            }
+
+            traverse(node);
+            ScopeStack.pop_back();
+        } else {
+            // it is assumed that the setter has pushed the scope already
+            node->symbols = PreCreatedScope;
+            PreCreatedScope = nullptr;
+
+            if (StructStack.back() && !StructStack.back()->scope) {
+                StructStack.back()->scope = node->symbols;
+                SymMan.lookupDecl(StructStack.back()->ident).scope = node->symbols;
+            }
+
+            traverse(node);
+        }
+    }
+
+
+    void handle(Struct* node) {
+        if (node->ident && !node->is_monomorphization)
+            return;
+
+        node->ident = getNewIDInfo(node->name);
+
+        const auto struct_ty = new StructType{};
+        struct_ty->ident = node->ident;
+
+        // build the field offsets
+        std::size_t i = 0;
+        for (Node* child : node->members->children) {
+            if (child->kind == ND_VAR) {
+                const auto field = static_cast<Var*>(child);
+                struct_ty->field_offsets.insert({field->name.data(), i++});
+            }
+        }
+
+        TypeManger.registerType(node->ident, struct_ty);
+        SymMan.registerDecl(node->ident, {
+            .is_exported = node->is_exported,
+            .swirl_type = struct_ty,
+            .node_ptr = node,
+        });
+
+        node->members->symbols = SymMan.newScope();
+        StructStack.push_back(struct_ty);
+
+        registerGenericParameters(node->generic_params, node->members);
+        traverse(node);
+
+        StructStack.pop_back();
+    }
+
+
+    void handle(Ident* node) {
+        if (node->value) return;
+
+        // attempt to resolve possibly local symbols
+        if (node->full_qualification.size() == 1 && node->full_qualification.at(0).generic_args.empty()) {
+            if (const auto result = searchForSymbol(node->full_qualification.front().name)) {
+                node->value = result;
+            }
+        }
+
+        for (auto& [_, generic_args, _] : node->full_qualification ) {
+            for (GenericArg* arg : generic_args) {
+                visit(arg);
+            }
+        }
+    }
+
+
+    void handle(Function* node) {
+        if (node->ident && !node->is_monomorphization)
+            return;
+
+        node->ident = getNewIDInfo(node->name);
+
+        const auto fn_type = new FunctionType();
+        fn_type->ident = node->ident;
+
+        FunctionStack.push_back(node);
+
+        assert(!StructStack.empty());
+        TableEntry entry {
+            .is_exported = node->is_exported,
+            .is_static   = node->is_static_method,
+            .swirl_type  = fn_type,
+            .method_of   = StructStack.back(),
+            .node_ptr    = node
+        };
+
+        TypeManger.registerType(node->ident, fn_type);
+        SymMan.registerDecl(node->ident, entry);
+
+        if (!node->children) {
+            node->children = makeNode<Scope>();
+        }
+
+        ScopeStack.push_back(node->children);
+
+        if (!node->children->symbols)
+            node->children->symbols = SymMan.newScope();
+
+        PreCreatedScope = node->children->symbols;
+
+        registerGenericParameters(node->generic_params, node->children);
+
+        traverse(node);
+        ScopeStack.pop_back();
+        FunctionStack.pop_back();
+    }
+
+
+    void handle(ForLoop* node) {
+        node->loop_var_id = getNewIDInfo(node->loop_var_name);
+
+        TableEntry entry;
+        SymMan.registerDecl(node->loop_var_id, entry);
+
+        node->children->symbols = SymMan.newScope();
+        ScopeStack.push_back(node->children);
+        traverse(node);
+        ScopeStack.pop_back();
+    }
+
+
+    void handle(TypeAlias* node) {
+        if (node->alias_for) {
+            node->ident = getNewIDInfo(node->alias);
+        }
+    }
+
+
+    bool preVisit(Var* node) {
+        if (node->var_ident) return true;
+
+        node->var_ident = getNewIDInfo(node->name);
+
+        TableEntry entry;
+        entry.is_const    = node->is_const;
+        entry.is_volatile = node->is_volatile;
+        entry.is_exported = node->is_exported;
+        entry.node_ptr    = node;
+        entry.is_comptime = node->is_comptime;
+
+        SymMan.registerDecl(node->var_ident, entry);
+        return true;
+    }
+
+
+    bool preVisit(Parameter* node) {
+        if (node->is_instance_param) {
+            // This is a 2-tier lookup to resolve the type of the instance parameter. If the struct
+            // stack is in a valid state then the reference to its type becomes the instance param's
+            // type. If it isn't set, as in the case of monomorphiztion of variadics, then an attempt
+            // is made to retrieve it via the registry of the parent Function's declaration. If everything
+            // fails, then it is concluded that the instance parameter isn't allowed in this context.
+            if (!StructStack.empty() && StructStack.back()) {
+                node->type = makeNode<TypeWrapper>(
+                    TypeManger.getReferenceType(StructStack.back(), !node->is_const));
+            }
+
+            else if (!FunctionStack.empty() && FunctionStack.back()) {
+                if (const auto parent = SymMan.lookupDecl(FunctionStack.back()->ident).method_of) {
+                    node->type = makeNode<TypeWrapper>(
+                        TypeManger.getReferenceType(parent, !node->is_const));
+                }
+            }
+
+            // protocol methods traverse their parameters directly (without pushing
+            // onto FunctionStack, whose bottom is seeded with nullptr), the instance
+            // parameter's type is unbound here and gets resolved to a reference of
+            // the implementing type when the impl's conformance against the protocol
+            // is checked
+            else if (FunctionStack.back() == nullptr) {
+            } else {
+                reportError(ErrCode::NO_INSTANCE_PARAM_HERE, {});
+                return false;
+            }
+        }
+
+        node->ident = getNewIDInfo(node->name);
+
+        TableEntry entry;
+        entry.is_const = node->is_const;
+        entry.is_param = true;
+        entry.node_ptr = node;
+
+        SymMan.registerDecl(node->ident, entry);
+        return true;
+    }
+
+
+    bool preVisit(Enum* node) const {
+        node->ident = getNewIDInfo(node->name);
+
+        TableEntry entry;
+        entry.is_enum  = true;
+        entry.node_ptr = node;
+        entry.is_exported = node->is_exported;
+        entry.scope = SymMan.newScope();
+
+        const auto ty = new EnumType();
+        ty->scope = entry.scope;
+        ty->id = node->ident;
+
+        // register all entries of the enumeration as fictitious ids
+        for (const auto id : node->entries | std::views::keys) {
+            const auto id_info = ty->scope->getNewIDInfo(id, true);
+            SymMan.registerFictitiousID(id_info, node);
+        }
+
+        SymMan.registerDecl(node->ident, entry);
+        TypeManger.registerType(node->ident, ty);
+
+        return true;
+    }
+
+
+    bool preVisit(Protocol* node) const {
+        node->ident = getNewIDInfo(node->name);
+
+        const auto type = new ProtocolConstraint();
+        type->id = node->ident;
+        type->protocol = node;
+
+        TableEntry entry;
+        entry.is_protocol = true;
+        entry.node_ptr    = node;
+        entry.swirl_type  = type;
+        entry.is_exported = node->is_exported;
+
+        SymMan.registerDecl(node->ident, entry);
+        TypeManger.registerType(node->ident, type);
+
+        return true;
+    }
+
+
+    IdentInfo* searchForSymbol(const std::string_view name) const {
+        if (const auto id = SymMan.getGlobalScope()->getIDInfoFor(name)) {
+            assert(id.value());
+            return id.value();
+        }
+
+        for (const Scope* scope : ScopeStack) {
+            if (scope) {
+                if (const auto id = scope->symbols->getIDInfoFor(name)) {
+                    assert(id.value());
+                    return id.value();
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    IdentInfo* getNewIDInfo(const std::string_view name) const {
+        assert(!ScopeStack.empty());
+
+        if (const auto* scope = ScopeStack.back()) {
+            assert(scope->symbols);
+            return scope->symbols->getNewIDInfo(name);
+        }
+
+        return SymMan.getGlobalScope()->getNewIDInfo(name);
+    }
+
+
+    bool isGlobalScope() const {
+        assert(!ScopeStack.empty());
+        return !ScopeStack.back();
+    }
+
+
+private:
+    void registerGenericParameters(std::span<GenericParam*> params, const Scope* scope) const {
+        // register generic params as types and decls in the scope
+        for (const auto& child : params) {
+            const auto id = scope->symbols->getNewIDInfo(child->name);
+            const auto gen_type = new GenericType();
+
+            SymMan.registerDecl(id, {.swirl_type = gen_type});
+
+            gen_type->id = id;
+            TypeManger.registerType(id, gen_type);
+        }
+    }
+};
+}

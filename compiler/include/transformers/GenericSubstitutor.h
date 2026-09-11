@@ -1,0 +1,139 @@
+#pragma once
+#include "ast/TransformVisitor.h"
+
+
+class GenericSubstitutor : public TransformVisitor<GenericSubstitutor> {
+public:
+    explicit GenericSubstitutor(Module* module, sw::ComptimeEvaluator& evaluator)
+        : TransformVisitor(module)
+        , m_Evaluator(evaluator) {}
+
+    /// Maps x to y, where x is the to-be-substituted value and y is the substitution value.
+    using SubstitutionMap_t = std::unordered_map<
+        std::string_view,
+        std::variant<std::monostate, sw::Value, Type*>>;
+
+
+    /// This struct is used to pass information regarding -
+    /// "What to substitute and with what?" down the call graph.
+    struct SubstitutionContext {
+        SubstitutionMap_t map;
+        std::string_view  substitution_name;  // the name of the new monomorphized node
+    };
+
+
+    Node* transform(const Function* node, SubstitutionContext& ctx) {
+        const auto transformed_fn = const_cast<Node*>(transformDefault(node, ctx));
+
+        const auto new_node = makeNode<Function>(*(transformed_fn->to<Function>()));
+
+        if (!m_IsWithinStruct) {
+            new_node->name = ctx.substitution_name;
+        }
+
+        return new_node;
+    }
+
+
+    Node* transform(const Struct* node, SubstitutionContext& ctx) {
+        m_IsWithinStruct = true;
+        const auto transformed_struct = const_cast<Node*>(transformDefault(node, ctx));
+        m_IsWithinStruct = false;
+
+        const auto new_node = makeNode<Struct>(*(transformed_struct->to<Struct>()));
+        new_node->name = ctx.substitution_name;
+        new_node->generic_params = {};
+        return new_node;
+    }
+
+
+    Node* transform(const Ident* node, SubstitutionContext& ctx) {
+        assert(!node->full_qualification.empty());
+
+        // check if the identifier's front matches against a generic parameter name
+        if (ctx.map.contains(node->full_qualification.front().name)) {
+            const auto element = ctx.map[node->full_qualification.front().name];
+
+            // substitute the ident with the comptime constant
+            if (std::holds_alternative<sw::Value>(element))
+                return m_Evaluator.makeNode(std::get<sw::Value>(element));
+
+            // otherwise, assume that it is a type and do a partial resolution
+            assert(std::holds_alternative<Type*>(element));
+            const auto ty = std::get<Type*>(element);
+
+            auto* id = makeNode<Ident>(*node);
+            id->full_qualification.front().value = ty->getIdent();
+            assert(id->full_qualification.front().value);
+            return cast<Node>(id);
+
+        } return const_cast<Node*>(transformDefault(node, ctx));
+    }
+
+
+    Node* transform(const TypeWrapper* node, SubstitutionContext& ctx) {
+        // perform a type substitution if id matches
+        if (const auto type_id = node->type_id) {
+            if (const auto name = type_id->full_qualification.front().name; ctx.map.contains(name)) {
+                const auto type = std::get_if<Type*>(&ctx.map[name]);
+                assert(type != nullptr);
+                auto* ret = makeNode<TypeWrapper>(*node);
+                ret->type = *type;
+                return ret;
+            }
+        }
+
+        auto* result = const_cast<Node*>(transformDefault(node, ctx));
+
+        // also substitute array_size, e.g., N in [T | N]
+        if (result->to<TypeWrapper>()->array_size) {
+            auto* size_node = const_cast<Node*>(static_cast<const Node*>(
+                result->to<TypeWrapper>()->array_size));
+            auto* new_size = run(size_node, ctx);
+            if (new_size != size_node) {
+                if (result == node) {
+                    // transformDefault returned original — make a copy
+                    result = makeNode<TypeWrapper>(*node);
+                    result->to<TypeWrapper>()->type = nullptr;
+                }
+                result->to<TypeWrapper>()->array_size =
+                    static_cast<Expression*>(new_size);
+            }
+        }
+
+        return result;
+    }
+
+
+    Node* transform(const Var* node, SubstitutionContext& ctx) {
+        auto* new_node = const_cast<Node*>(transformDefault(node, ctx));
+        // always reset var_ident so SymbolRegistrationPass re-registers them
+        new_node->to<Var>()->var_ident = nullptr;
+        return new_node;
+    }
+
+
+    Node* transform(const Parameter* node, SubstitutionContext& ctx) {
+        auto* new_node = const_cast<Node*>(transformDefault(node, ctx));
+        // always reset var_ident so SymbolRegistrationPass re-registers params
+        new_node->to<Parameter>()->ident = nullptr;
+        return new_node;
+    }
+
+    /// If the expression's inferred type contains a generic, rebuild it to trigger
+    /// a re-evaluation into a concrete type.
+    Node* transform(const Expression* node, SubstitutionContext& ctx) {
+        if (node->expr_type && node->expr_type->containsGeneric()) {
+            auto* new_node = makeNode<Expression>(
+                *cast<Expression>(transformDefault(node, ctx)));
+
+            new_node->expr_type = nullptr;
+            return new_node;
+        } return cast<Node>(transformDefault(node, ctx));
+    }
+
+
+private:
+    sw::ComptimeEvaluator& m_Evaluator;
+    bool m_IsWithinStruct = false;
+};

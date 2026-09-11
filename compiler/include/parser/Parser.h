@@ -1,11 +1,6 @@
 #pragma once
-#include <memory>
-#include <mutex>
 #include <utility>
-#include <concepts>
 #include <filesystem>
-#include <unordered_set>
-#include <print>
 
 #include "definitions.h"
 #include "ast/Nodes.h"
@@ -15,163 +10,135 @@
 #include "symbols/SymbolManager.h"
 
 #include "ExpressionParser.h"
+#include "utils/FileSystem.h"
+#include "utils/StringPool.h"
 
 
 class Parser;
 class ModuleManager;
-class AnalysisContext;
+struct Module;
+
+namespace sw {
+    class StringPool;
+    class FileSystem;
+}
+
+namespace sema {
+    template <typename T> class SemaVisitor;
+}
 
 
-/// A type which can represent either a `Type*` or a `Node*`.
-struct SwObject : std::variant<Type*, Node*> {
-    using std::variant<Type*, Node*>::variant;
-
-    [[nodiscard]] Type* toType() const {
-        assert(isType());
-        return std::get<Type*>(*this);
-    }
-
-    [[nodiscard]] Node* toNode() const {
-        assert(isNode());
-        return std::get<Node*>(*this);
-    }
-
-    [[nodiscard]] bool isType() const {
-        return std::holds_alternative<Type*>(*this);
-    }
-
-    [[nodiscard]] bool isNode() const {
-        return std::holds_alternative<Node*>(*this);
-    }
-};
-
-
-template <>
-struct std::hash<SwObject> {
-    std::size_t operator()(const SwObject& obj) const noexcept {
-        return std::hash<std::variant<Type*, Node*>>{}(obj);
-    }
+struct ParserContext {
+    Module* module;
+    ErrorCallback_t error_callback;
+    ModuleManager&  module_manager;
+    sw::StringPool& string_pool;
 };
 
 
 class Parser {
-    TokenStream    m_Stream;
-    SourceManager  m_SrcMan;
-    ModuleManager& m_ModuleMap;
+    TokenStream      m_Stream;
+    SourceManager    m_SrcMan;
 
-    ErrorCallback_t m_ErrorCallback;  // the callback for reporting an error
+    Module*          m_Module;
+    ErrorCallback_t  m_ErrorCallback;  // the callback for reporting an error
     ExpressionParser m_ExpressionParser{*this};
 
     // ---*--- Flags  ---*---
-    Function*    m_LatestFuncNode = nullptr;
+    Function*    m_LatestFuncNode     = nullptr;
     bool         m_LastSymWasExported = false;
     bool         m_LastSymIsExtern    = false;
-    bool         m_IsMainModule       = false;    // is the module the parser represents the main one?
-    bool         m_IsBeingCloned      = false;
 
-    std::size_t  m_CloneCount = 0;
-    std::vector<Type*> m_CurrentStructTy{nullptr};  // the type of the struct being parsed
-
-    std::string m_ExternAttributes;
-    Expression  m_AttributeList;
-    std::optional<Token> m_ReturnFakeToken = std::nullopt;
+    std::string          m_ExternAttributes;
+    Expression*          m_AttributeList = nullptr;
     // ---*--- ---*--- ---*---
 
-    int                   m_Depth = 0;
-    std::size_t           m_UnresolvedDeps{};  // counter for the no. of unresolved dependencies
-    std::vector<SwObject> m_ParseStack;        // currently-being-parsed object pointer stays at the top
+    int                   m_RecursionDepth = 0;
+    std::vector<Node*>    m_ParseStack;        // currently-being-parsed object pointer stays at the top
 
-    std::filesystem::path m_FilePath;
-
-    std::unordered_set<Parser*> m_Dependents;     // the modules which depend on this module
-    std::unordered_set<Parser*> m_Dependencies;  // the modules which this module depends on
+    sw::FileHandle*       m_FileHandle;
 
     // used for buffering error reports until the nodes/types have been completed
-    std::unordered_map<SwObject, std::vector<std::tuple<ErrCode, ErrorContext>>> m_ErrorQueue;
+    std::unordered_map<Node*, std::vector<std::tuple<ErrCode, ErrorContext>>> m_ErrorQueue;
 
-    // maps the IdentInfo* of global nodes (nodes inheriting from `GlobalNode`) to where they begin and
-    // where they end
-    std::unordered_map<IdentInfo*, std::array<StreamState, 2>> m_GlobalOffsets;
+    sw::FileSystem& m_FileSystem;
+    sw::StringPool& m_StringPool;
 
     struct Bracket_t { char val{}; StreamState location; };
     std::vector<Bracket_t> m_BracketTracker;
+
+    // extern declaration buffer
+    std::vector<Node*> m_ExternBlockBuffer;
+    size_t             m_ExternBlockIdx = 0;
 
     struct NodeAttrHelper;
 
     friend class CompilerInst;
     friend class ModuleManager;
-    friend class LLVMBackend;
-    friend class AnalysisContext;
     friend class ExpressionParser;
-    friend class ClonedState;
+    friend class LLVMBackend;
 
+    template <typename T>
+    friend class sema::SemaVisitor;
 
 public:
-    SymbolManager SymbolTable;
+    ModuleManager& ModuleMap;
 
-    AST_t AST;
-    std::unordered_map<IdentInfo*, Node*> NodeJmpTable;  // maps global symbols to their nodes
+    explicit Parser(const ParserContext& context);
 
-    explicit Parser(const std::filesystem::path& path, ErrorCallback_t, ModuleManager&);
 
-    using GenericArgList_t = std::vector<TypeWrapper>;
+    Node* dispatch();
+    Node* parseExternBlock();
 
-    std::unique_ptr<Node>            dispatch();
-    std::unique_ptr<Function>        parseFunction();
-    std::unique_ptr<Condition>       parseCondition();
-    std::unique_ptr<WhileLoop>       parseWhile();
-    std::unique_ptr<Struct>          parseStruct();
-    std::unique_ptr<ImportNode>      parseImport();
-    std::unique_ptr<Scope>           parseScope();
-    std::unique_ptr<ReturnStatement> parseRet();
-    std::unique_ptr<Intrinsic>       parseIntrinsic();
-    std::unique_ptr<Protocol>        parseProtocol();
+    Function*        parseFunction();
+    WhileLoop*       parseWhile();
+    Struct*          parseStruct();
+    ImportNode*      parseImport();
+    ReturnStatement* parseRet();
+    Intrinsic*       parseIntrinsic();
+    Protocol*        parseProtocol();
+    Enum*            parseEnum();
+    TypeAlias*       parseTypeAlias();
+    ProtocolImpl*    parseProtocolImpl();
 
-    Var parseParam(bool&);
-    std::unique_ptr<Var>      parseVar(bool is_volatile = false);
-    std::unique_ptr<FuncCall> parseCall(std::optional<Ident> _ = std::nullopt);
+    ForLoop*   parseForLoop  (bool is_comptime = false);
+    Condition* parseCondition(bool is_comptime = false);
 
-    std::vector<Ident>                parseProtocolList();
-    std::vector<GenericParam>         parseGenericParamList();
+    Var*        parseVar(bool is_comptime = false);
+    Node*       parseCall(std::optional<Ident*> _ = std::nullopt);
+    Parameter*  parseParam(bool&);
 
-    // Returns the clone of the node with the `IdentInfo*` `id`
-    std::unique_ptr<Node> cloneNode(IdentInfo* id);
+    template <typename Fn = std::identity>
+    Scope* parseScope(const Fn& hook = std::identity{});
+
+    std::span<Ident*>         parseProtocolList();
+    std::span<GenericParam*>  parseGenericParamList();
 
     Token forwardStream(uint8_t n = 1);
 
-    Ident            parseIdent();
-    Expression       parseExpr();
-    TypeWrapper      parseType();
-    GenericArgList_t parseGenericArgList();
+    Ident*           parseIdent(bool type_context = false);
+    Expression*      parseExpr();
+    TypeWrapper*     parseType();
+    GenericArgList   parseGenericArgList();
 
     void parse();
-    void performSema();
     void ignoreButExpect(const Token&);
+    void ignoreButExpect(Token::TokenValue tok);
+
     void stackSafeguard() const;
 
-    void toggleIsMainModule() { m_IsMainModule = !m_IsMainModule; }
+    /// Returns the current token and reports an error if it doesn't match the given token id
+    Token expect(Token::TokenValue tok);
 
-    std::size_t getCloneCount() {
-        return ++m_CloneCount;
-    }
-
-    /// Calls `inserter` with the symbol name for each exported-symbol in the AST
-    template <typename Inserter_t> requires std::invocable<Inserter_t, std::string>
-    void insertExportedSymbolsInto(Inserter_t inserter) {
-        for (const auto& node : AST) {
-            if (node->is_exported) {
-                inserter(node->getIdentInfo()->toString());
-            }
-        }
-    }
-
-    /// Decrements the unresolved-deps counter of dependents
-    void decrementUnresolvedDeps();
 
     /// Buffers the reported errors, also sets certain context attributes automatically
     void reportError(const ErrCode code, ErrorContext ctx = {}) {
-        ctx.src_man = &m_SrcMan;
+        ctx.module = m_Module;
         m_ErrorQueue.at(m_ParseStack.back()).emplace_back(code, ctx);
+    }
+
+    std::string_view internString(const std::string_view str) const {
+        return m_StringPool.intern(str);
     }
 };
 
@@ -179,10 +146,15 @@ public:
 struct Parser::NodeAttrHelper {
     /// Chief Node constructor
     NodeAttrHelper(Node* node, Parser& instance): node(node), instance(instance) {
-        node->is_exported = instance.m_LastSymWasExported;
+        if (node->isGlobal()) {
+            node->to<GlobalNode>()->is_exported = instance.m_LastSymWasExported;
+        }
+
         node->location.from = instance.m_Stream.getStreamState();
-        node->location.source = instance.m_FilePath;
-        instance.m_Depth++;
+        node->location.from.Pos -= instance.m_Stream.CurTok.value.size();
+
+        node->location.source = instance.m_FileHandle;
+        instance.m_RecursionDepth++;
 
         instance.stackSafeguard();
 
@@ -194,7 +166,7 @@ struct Parser::NodeAttrHelper {
         if (node->isGlobal()) {
             const auto glob = dynamic_cast<GlobalNode*>(node);
             glob->is_extern = instance.m_LastSymIsExtern;
-            glob->extern_attributes = instance.m_ExternAttributes;
+            glob->extern_attributes = instance.m_StringPool.intern(instance.m_ExternAttributes);
 
             begins_from = instance.m_Stream.getStreamState();
         }
@@ -203,23 +175,14 @@ struct Parser::NodeAttrHelper {
 
     /// Resets the states of the Parser
     ~NodeAttrHelper() {
-        instance.m_Depth--;
+        instance.m_RecursionDepth--;
         instance.m_LastSymIsExtern = false;
         instance.m_LastSymWasExported = false;
         instance.m_ExternAttributes.clear();
 
         if (node) {
             node->location.to = instance.m_Stream.getStreamState();
-
-            if (node->isGlobal()) {
-                auto node_id = node->getIdentInfo();
-
-                assert(node_id != nullptr);
-                assert(begins_from.has_value());
-
-                instance.m_GlobalOffsets.insert({node_id, {
-                    begins_from.value(), instance.m_Stream.getStreamState()}});
-            }
+            node->location.to.Pos -= instance.m_Stream.CurTok.value.size();
         }
 
         // flush all the errors

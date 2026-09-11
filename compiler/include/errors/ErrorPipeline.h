@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <string_view>
 
-#include "managers/SourceManager.h"
 #include "errors/ErrorManager.h"
+#include "modules/ModuleManager.h"
 
 
 /// This class allows the decoupling of the ErrorManager from error-formatting and output details.
@@ -19,7 +19,7 @@ public:
         std::fill(backticks.begin(), backticks.end(), ' ');
 
         backticks.append("|\t");
-        for (int i = 0; i < ctx.location->from.Col; i++) {
+        for (int i = 0; i < ctx.location->from.Col-1; i++) {
             backticks.append(" ");
         }
 
@@ -36,11 +36,11 @@ public:
             "\n{} |\t{}"  // line no., line
             "{}\n"        // spaces and the `^`
             "\n\tError: {}\n\n",
-            ctx.src_man->getSourcePath().string(),
+            ctx.module->file_handle->getPath().string(),
             ctx.location->from.Line,
             ctx.location->from.Col,
             ctx.location->from.Line,
-            ctx.src_man->getLineAt(ctx.location->from.Line),
+            ctx.module->getLineAt(ctx.location->from.Line),
             backticks,
             message
         );

@@ -1,6 +1,4 @@
 #pragma once
-#include <memory>
-
 #include "ast/Nodes.h"
 
 
@@ -12,10 +10,13 @@ class TokenStream;
 class ExpressionParser {
     Parser& m_Parser;
 
-    std::unique_ptr<Node> parseComponent();
-    std::unique_ptr<Node> parsePrefix();
+    Node* parseComponent();
+    Node* parsePrefix();
 
 public:
+    [[nodiscard]]
+    std::string_view internString(std::string_view str) const;
+
     explicit ExpressionParser(Parser& parser);
     Expression parseExpr(int rbp = -1);
 };

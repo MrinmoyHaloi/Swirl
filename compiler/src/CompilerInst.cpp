@@ -1,9 +1,9 @@
 #include "CompilerInst.h"
-
 #include "backend/LLVMBackend.h"
+
+#include <lld/Common/Driver.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/FileSystem.h>
-#include <lld/Common/Driver.h>
 
 #ifdef __linux__
 LLD_HAS_DRIVER(elf)
@@ -23,7 +23,6 @@ LLD_HAS_DRIVER(mingw)
         #define SW_LLD_FLAVOR lld::MinGW
     #endif
 #endif
-
 
 void CompilerInst::addPackageEntry(const std::string_view package, const bool is_project) {
     // when true, do not try to parse the author-name and package-version from the path
@@ -47,15 +46,17 @@ void CompilerInst::startLLVMCodegen() {
     Backends_t llvm_backends;
     llvm_backends.reserve(m_ModuleManager.size());
 
-    for (Parser* parser : m_ModuleManager) {
-        auto* backend = llvm_backends.emplace_back(new LLVMBackend{*parser}).get();
-        m_ThreadPool.enqueue([backend] {
-            backend->startGeneration();
-        });
-    } m_ThreadPool.wait();
+    for (Module* module : m_ModuleManager) {
+        auto* backend = llvm_backends.emplace_back(new LLVMBackend{module}).get();
+        m_ThreadPool.enqueue([backend, module] { backend->dispatch(module->ast); });
+    }
 
-    for (const auto& backend : llvm_backends) {
-        backend->printIR();
+    m_ThreadPool.wait();
+
+    if (SW_IS_DEBUG) {
+        for (const auto& backend : llvm_backends) {
+            backend->printIR();
+        }
     }
 
     generateObjectFiles(llvm_backends);
@@ -80,9 +81,8 @@ void CompilerInst::generateObjectFiles(Backends_t& backends) {
     for (const auto& [counter, backend] : llvm::enumerate(backends)) {
         llvm::legacy::PassManager pass_man;
         std::error_code ec;
-        llvm::raw_fd_ostream dest((build_dir / "obj" / ("output_" + std::to_string(counter))).string(),
-            ec,
-            llvm::sys::fs::OpenFlags::OF_None);
+        llvm::raw_fd_ostream dest((build_dir / "obj" / ("output_" + std::to_string(counter))).string(), ec,
+                                  llvm::sys::fs::OpenFlags::OF_None);
 
         if (ec) {
             throw std::runtime_error("llvm::raw_fd_ostream failed! " + ec.message());
@@ -100,19 +100,19 @@ void CompilerInst::generateObjectFiles(Backends_t& backends) {
 }
 
 void CompilerInst::produceExecutable() {
-    const auto triple = llvm::Triple(TargetTriple);
+    const auto triple = Target.getTriple();
     const auto build_dir = m_SrcPath.parent_path() / ".build";
 
     std::string runtime_filename{"runtime_"};
 
     switch (triple.getOS()) {
-    case llvm::Triple::Linux:
+    case sw::Target::Linux:
         runtime_filename += "linux_";
         break;
-    case llvm::Triple::Darwin:
+    case sw::Target::Darwin:
         runtime_filename += "darwin_";
         break;
-    case llvm::Triple::Win32:
+    case sw::Target::Windows:
         runtime_filename += "windows_";
         break;
     default:
@@ -120,13 +120,13 @@ void CompilerInst::produceExecutable() {
     }
 
     switch (triple.getArch()) {
-    case llvm::Triple::x86:
+    case sw::Target::x86:
         runtime_filename += "x86";
         break;
-    case llvm::Triple::x86_64:
+    case sw::Target::x64:
         runtime_filename += "x64";
         break;
-    case llvm::Triple::aarch64:
+    case sw::Target::ARM64:
         runtime_filename += "aarch64";
         break;
     default:
@@ -134,96 +134,111 @@ void CompilerInst::produceExecutable() {
     }
 
     // add the extension, `.o` for linux and mac, `.obj` for windows
-    runtime_filename += triple.getOS() == llvm::Triple::Win32 ? ".obj" : ".o";
+    runtime_filename += triple.getOS() == sw::Target::Windows ? ".obj" : ".o";
 
-    // the relative path to the swirl runtime
-    const auto runtime_path = fs::path("..") / "lib" / runtime_filename;
+    // path to the swirl runtime stored in the lib folder of parent directory to source file
+    const auto runtime_path = (m_SrcPath.parent_path() / "lib" / runtime_filename).string();
 
     // decide driver flavor based on toolchain
-    const bool is_win = triple.getOS() == llvm::Triple::Win32;
+    const bool is_win = triple.getOS() == sw::Target::Windows;
+    const bool is_linux = triple.getOS() == sw::Target::Linux;
 
     // a DriverDef is composed of a "flavor" and a `link` "callback"
     lld::DriverDef platform_driver = {SW_LLD_FLAVOR, &lld::SW_LLD_DRIVER_NAMESPACE::link};
 
-    // accumulate the runtime files
-    std::vector<std::string> sw_runtime{};
-    sw_runtime.push_back(runtime_path.string());
-
     // toolchain-specific linker args (kept as strings for lifetime)
+    std::vector<std::string> args{SW_LLD_DRIVER_NAME};
     std::vector<std::string> toolchain_args;
 
     if (is_win) {
-#ifdef _MSC_VER
-        // MSVC toolchain
-        sw_runtime.emplace_back("kernel32.lib");
-        sw_runtime.emplace_back("shell32.lib");
-        sw_runtime.emplace_back("/subsystem:console");
-        sw_runtime.emplace_back("/entry:_start");
-        sw_runtime.emplace_back("/STACK:8388607");
-#else
-        // MinGW toolchain
-        sw_runtime.emplace_back("C:\\Windows\\System32\\kernel32.dll");
-        sw_runtime.emplace_back("C:\\Windows\\System32\\shell32.dll");
-        sw_runtime.emplace_back("/subsystem:console");
-        sw_runtime.emplace_back("/entry:_start");
-        sw_runtime.emplace_back("/STACK:8388607");
-#endif
-    }
+        args.push_back(runtime_path);
 
-    // accumulate the linker arguments
-    std::vector args{SW_LLD_DRIVER_NAME};
+        // iterate over all object files of the build directory and push their paths to the vector
+        for (const auto& file : fs::directory_iterator(build_dir / "obj")) {
+            args.push_back(file.path().string());
+        }
 
-    // push all the runtime files
-    for (auto& arg : sw_runtime) {
-        args.push_back(arg.c_str());
+        args.emplace_back((m_SrcPath.parent_path() / "lib" / "libkernel32.a").string());
+        args.emplace_back((m_SrcPath.parent_path() / "lib" / "libshell32.a").string());
+        args.push_back("/subsystem:console");
+        args.push_back("/entry:_start");
+        args.push_back("/STACK:8388607");
+
+    } else if (is_linux) {
+        args.push_back("-static");
+        if (exists(m_SrcPath.parent_path() / "lib")) {
+            args.push_back("-L" + ((m_SrcPath.parent_path() / "lib")).string());
+            args.push_back((m_SrcPath.parent_path() / "lib" / "crt1.o").string());
+            args.push_back((m_SrcPath.parent_path() / "lib" / "crti.o").string());
+
+            // iterate over all object files of the build directory and push their paths to the vector
+            for (const auto& file : fs::directory_iterator(build_dir / "obj")) {
+                args.push_back(file.path().string());
+            }
+
+            args.push_back("--start-group");
+            args.push_back("-lc");
+            args.push_back("--end-group");
+            args.push_back((m_SrcPath.parent_path() / "lib" / "crtn.o").string());
+        } else {
+            args.push_back("-L/usr/local/lib/swirl");
+            args.push_back("/usr/local/lib/swirl/crt1.o");
+            args.push_back("/usr/local/lib/swirl/crti.o");
+
+            // iterate over all object files of the build directory and push their paths to the vector
+            for (const auto& file : fs::directory_iterator(build_dir / "obj")) {
+                args.push_back(file.path().string());
+            }
+
+            args.push_back("--start-group");
+            args.push_back("-lc");
+            args.push_back("--end-group");
+            args.push_back("/usr/local/lib/swirl/crtn.o");
+        }
     }
 
     // push toolchain-specific args (e.g., -L<mingw>/lib)
     for (auto& a : toolchain_args) {
-        args.push_back(a.c_str());
-    }
-
-    // iterate over all object files of the build directory and push their paths to the vector
-    for (const auto& file : fs::directory_iterator(build_dir / "obj")) {
-        args.push_back((new std::string(file.path().string()))->c_str());
+        args.push_back(a);
     }
 
     // compute the output path
-    if (m_OutputPath.empty()) {
-        m_OutputPath = m_SrcPath.parent_path() / ".build" /
+    if (OutputPath.empty()) {
+        OutputPath = m_SrcPath.parent_path() / ".build" /
                        (m_SrcPath.filename().replace_extension().string() + (is_win ? ".exe" : ""));
     }
 
 // push the output path to the vector
 #ifdef _MSC_VER
     // For MSVC, combine /OUT: with the path
-    std::string outputArg = "/OUT:" + m_OutputPath.string();
-    args.push_back((new std::string(outputArg))->c_str());
+    args.push_back(std::format("/OUT:{}", OutputPath.string()));
 #else
     args.push_back("-o");
-    args.push_back((new std::string(m_OutputPath.string()))->c_str());
+    args.push_back(OutputPath.string());
 #endif
-
-    if (!is_win) {
-        // Add standard library search paths
-        args.push_back("-L/usr/lib");
-        args.push_back("-L/usr/lib64");
-        args.push_back("-L/lib");
-        args.push_back("-L/lib64");
-    }
 
     for (auto& lib : LinkTargets) {
         // Check if this is a full path to a library
         if (lib.starts_with('/')) {
             // If it's a full path, add it directly without -l
-            args.push_back((new std::string(lib))->c_str());
+            args.push_back(lib);
         } else if (is_win) {
-            args.push_back((new std::string(lib + ".lib"))->c_str());
+            args.push_back(std::format("{}.lib", lib));
         } else {
-            args.push_back((new std::string("-l" + std::string(lib)))->c_str());
+            args.push_back(std::format("-l{}", lib));
         }
     }
 
+    std::vector<const char*> llvm_args;
+    llvm_args.reserve(args.size());
+
+    for (const auto& s : args) {
+        llvm_args.push_back(s.c_str());
+    }
+
     // do the final ritual
-    lld::lldMain(args, llvm::outs(), llvm::errs(), {platform_driver});
+    lld::lldMain(llvm_args, llvm::outs(), llvm::errs(), {platform_driver});
+    if (RunExe) {
+        system(std::format("{}", OutputPath.string()).c_str());
+    }
 }

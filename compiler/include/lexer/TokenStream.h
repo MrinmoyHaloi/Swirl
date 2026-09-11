@@ -7,8 +7,9 @@
 
 
 class TokenStream {
-    StreamState                 m_Cache;    // For caching stream state
-    SourceManager&              m_Stream;
+    StreamState     m_Cache;    // For caching stream state
+    std::vector<Token> m_Pushback;  // Token pushback buffer for generic arg >> splitting
+    SourceManager&  m_Stream;
 
     bool m_isPreviousTokIdent = false;
 
@@ -16,7 +17,7 @@ class TokenStream {
         bool  is_active = false;
         bool  only_type = false;
         std::vector<Token> expected_tokens;
-        std::vector<TokenType> expected_types;
+        std::vector<TokenCategory> expected_types;
     }                           m_Filter;
 
     static bool isKeyword(const std::string& _str);
@@ -67,11 +68,12 @@ public:
     void restoreCache() const;
 
     /// what token *types* are expected next
-    [[deprecated]] void expectTypes(std::initializer_list<TokenType>&& types);
+    [[deprecated]] void expectTypes(std::initializer_list<TokenCategory>&& types);
 
     /// when particular tokens are expected next
     [[deprecated]] void expectTokens(std::initializer_list<Token>&& tokens);
 
+    void pushback(Token tok);
     Token next(bool modify_cur_tk = true);
     Token peek();
 

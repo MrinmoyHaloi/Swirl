@@ -58,6 +58,11 @@ inline std::string ErrorManager::generateMessage(const ErrCode code, const Error
                 ctx.type_2->toString()
                 );
 
+        case ErrCode::ONLY_INTEGRAL_BITWISE:
+            return "Only integral operands are allowed for bitwise operators.";
+        case ErrCode::EXPONENTIAL_RHS_INTEGRAL:
+            return "The RHS of an exponential operator must be of an integral type.";
+
         case ErrCode::NO_IMPLICIT_CONVERSION:
             return "No implicit conversion is defined for the involved types.";
         case ErrCode::INT_AND_FLOAT_CONV:
@@ -95,12 +100,49 @@ inline std::string ErrorManager::generateMessage(const ErrCode code, const Error
             );
         case ErrCode::NO_SUCH_PROTOCOL:
             return std::format("No such protocol exists.");
-        case ErrCode::PROTOCOL_NOT_SATISFIED:
+        case ErrCode::PROTOCOL_VIOLATED:
             return std::format(
-                "The protocol {} requires `{}`'s implementation.",
+                "The protocol `{}` requires a method `{}`, which is not implemented.",
                 ctx.str_1,
                 ctx.str_2
                 );
+        case ErrCode::PROTOCOL_METHOD_MISMATCH:
+            return std::format(
+                "The implementation of `{}` does not satisfy the protocol `{}`: {}",
+                ctx.str_2,
+                ctx.str_1,
+                ctx.msg
+                );
+        case ErrCode::DEPENDENCY_PROTOCOL_MISSING:
+            return std::format(
+                "The protocol `{}` which this protocol depends on has not been implemented.",
+                ctx.str_1);
+        case ErrCode::TYPE_ALIAS_REQUIRED:
+            return std::format(
+                "The type alias `{}` is required by the protocol `{}`.",
+                ctx.str_1,
+                ctx.str_2
+            );
+        case ErrCode::DUPLICATE_PROTO_IMPL:
+            return std::format(
+                "The implementation of the protocol `{}` already exists for the type `{}` "
+                "in the module or its dependencies.", ctx.str_1, ctx.str_2);
+
+        case ErrCode::PROTO_IMPL_NOT_EXPORTED:
+            return std::format(
+                "The implementation of the protocol `{}` for the type `{}` exists "
+                "but is not exported by its parent module",
+                ctx.str_1, ctx.str_2
+            );
+
+        case ErrCode::PROTOCOL_NOT_IMPLEMENTED:
+            return std::format(
+                "The type `{}` does not implement the protocol `{}`.",
+                ctx.str_2, ctx.str_1
+            );
+
+        case ErrCode::ENUM_TYPE_NOT_INTEGRAL:
+            return "Enumeration types must be integral.";
 
 
         case ErrCode::NO_DIR_IMPORT:
@@ -124,7 +166,20 @@ inline std::string ErrorManager::generateMessage(const ErrCode code, const Error
         case ErrCode::PACKAGE_NOT_FOUND:
             return std::format("No package with the name `{}` is registered.", ctx.str_1);
 
+        case ErrCode::NOT_CALLABLE:
+            return std::format("`{}` is not callable.", ctx.str_1);
+        case ErrCode::NOT_A_GENERIC:
+            return std::format("{} is not a generic construct.", ctx.str_1);
+        case ErrCode::NOT_ENOUGH_ARGS:
+            return std::format(
+                "Function `{}` takes {} arguments, but {} were provided.",
+                ctx.str_1,
+                ctx.type_1->to<FunctionType>()->param_types.size(),
+                ctx.str_2
+                );
 
+        case ErrCode::TOO_MANY_GENERIC_ARGS:
+            return std::format("Too many generic arguments.");
         case ErrCode::INITIALIZER_REQUIRED:
             return "Initialization is required here.";
         case ErrCode::NON_INTEGRAL_INDICES:
@@ -133,6 +188,13 @@ inline std::string ErrorManager::generateMessage(const ErrCode code, const Error
             return "You will have to explicitly specify a return type here.";
         case ErrCode::QUALIFIER_UNDEFINED:
             return std::format("The qualifier '{}' is undefined.", ctx.str_1);
+        case ErrCode::AMBIGUOUS_MEMBER:
+            return std::format(
+                "The member '{}' is ambiguous: it is provided by more than one scope. "
+                "Use `(instance as Protocol).{}()` to disambiguate.",
+                ctx.str_1,
+                ctx.str_1
+                );
         case ErrCode::UNDEFINED_IDENTIFIER:
             return std::format("The identifier '{}' is undefined.", ctx.str_1);
         case ErrCode::NOT_A_NAMESPACE:
@@ -149,6 +211,12 @@ inline std::string ErrorManager::generateMessage(const ErrCode code, const Error
             return "Configuration variables must be initialized with literals.";
         case ErrCode::SLICE_NOT_COMPATIBLE:
             return "Incompatible slice.";  // TODO
+        case ErrCode::CONDITION_NOT_BOOL:
+            return "Conditions must be boolean expressions.";
+        case ErrCode::EXTERN_CANNOT_HAVE_BODY:
+            return "External constructs cannot have a body.";
+        case ErrCode::NO_INSTANCE_PARAM_HERE:
+            return "An instance parameter cannot appear here.";
 
         case ErrCode::NOT_ALLOWED_CT_CTX:
             return "This construct is not allowed in compile-time evaluated context.";
@@ -156,6 +224,17 @@ inline std::string ErrorManager::generateMessage(const ErrCode code, const Error
             return "Only other comptime variables' IDs can be written in this context.";
         case ErrCode::OP_NOT_ALLOWED_HERE:
             return std::format("The operator '{}' isn't allowed in this context.", ctx.str_1);
+        case ErrCode::CHAR_LIT_TOO_LONG:
+            return "Character literals can only have one character. Use a string a literal (\"...\") or"
+                   " remove the extra characters.";
+        case ErrCode::CHAR_LIT_EMPTY:
+            return "Character literals cannot be empty.";
+        case ErrCode::PARAM_MUST_HAVE_TYPE:
+            return "Non-variadic parameters must have an explicit type.";
+        case ErrCode::VARIADIC_AT_END:
+            return "Variadic Parameter cannot be followed by regular parameters.";
+        case ErrCode::ONLY_ONE_VARIADIC:
+            return "There must only be a single variadic parameter at the end.";
         default:
             throw std::runtime_error("Undefined error code");
     }

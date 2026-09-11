@@ -1,21 +1,23 @@
 #pragma once
-#include <list>
 #include <string>
 #include <utility>
 #include <unordered_map>
 
+#include "utils/FileSystem.h"
 
 class IdentInfo {
     std::string id;
-    std::filesystem::path mod_path;
+    sw::FileHandle* handle = nullptr;
+    bool is_fictitious = false;
     friend class IdentManager;
 
 public:
     IdentInfo() = delete;
 
-    explicit IdentInfo(std::string ident, std::filesystem::path path)
+    explicit IdentInfo(std::string ident, sw::FileHandle* mod_handle, const bool is_fictitious = false)
         : id(std::move(ident))
-        , mod_path(std::move(path)) {}
+        , handle(mod_handle)
+        , is_fictitious(is_fictitious) {}
 
     [[nodiscard]]
     const std::string& toString() const {
@@ -23,24 +25,29 @@ public:
     }
 
     [[nodiscard]]
-    const std::filesystem::path& getModulePath() const {
-        return mod_path;
+    sw::FileHandle* getModuleFileHandle() const {
+        return handle;
+    }
+
+    [[nodiscard]]
+    bool isFictitious() const {
+        return is_fictitious;
     }
 };
 
 
 class IdentManager {
     std::unordered_map<std::string, std::unique_ptr<IdentInfo>> m_IdentTable;
-    std::filesystem::path m_ModPath;
+    sw::FileHandle* m_ModuleHandle{};
 
     friend class SymbolManager;
 
 public:
-    explicit IdentManager(std::filesystem::path mod_path): m_ModPath(std::move(mod_path)) {}
+    explicit IdentManager(sw::FileHandle* mod_handle): m_ModuleHandle(mod_handle) {}
 
     /// registers a new IdentInfo and returns its pointer
-    IdentInfo* createNew(const std::string& id) {
-        m_IdentTable.emplace(id, new IdentInfo(id, m_ModPath));
+    IdentInfo* createNew(const std::string& id, const bool is_fictitious = false) {
+        m_IdentTable.emplace(id, new IdentInfo(id, m_ModuleHandle, is_fictitious));
         return m_IdentTable.at(id).get();
     }
 
@@ -53,8 +60,8 @@ public:
         return m_IdentTable.contains(id);
     }
 
-    const fs::path& getModulePath() const {
-        return m_ModPath;
+    const sw::FileHandle* getModuleFileHandle() const {
+        return m_ModuleHandle;
     }
 
     auto begin() const {
