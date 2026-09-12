@@ -94,7 +94,7 @@ IdentInfo* SymbolManager::getIDInfoFor(const Ident& id, const std::optional<Erro
             report_error(
                 ErrCode::NOT_A_NAMESPACE,
                 {
-                    .str_1 = id.full_qualification.at(counter - 1).name,
+                    .str_1 = id.full_qualification[counter - 1].name,
                     .location = id.location
                 });
             return nullptr;
@@ -107,7 +107,7 @@ IdentInfo* SymbolManager::getIDInfoFor(const Ident& id, const std::optional<Erro
                 ErrCode::NO_SYMBOL_IN_NAMESPACE,
                 {
                     .str_1 = str.name,
-                    .str_2 = id.full_qualification.at(counter - 1).name,
+                    .str_2 = id.full_qualification[counter - 1].name,
                     .location = id.location
                 });
             return nullptr;
@@ -131,7 +131,7 @@ IdentInfo* SymbolManager::getIDInfoFor(const Ident& id, const std::optional<Erro
         report_error(
             ErrCode::NOT_A_NAMESPACE,
             {
-                .str_1 = id.full_qualification.at(id.full_qualification.size() - 2).name,
+                .str_1 = id.full_qualification[id.full_qualification.size() - 2].name,
                 .location = id.location
             });
         return nullptr;
@@ -155,7 +155,7 @@ IdentInfo* SymbolManager::getIDInfoFor(const Ident& id, const std::optional<Erro
             ErrCode::NO_SYMBOL_IN_NAMESPACE,
             {
                 .str_1 = id.full_qualification.back().name,
-                .str_2 = id.full_qualification.at(id.full_qualification.size() - 2).name,
+                .str_2 = id.full_qualification[id.full_qualification.size() - 2].name,
                 .location = id.location
             });
         return nullptr;
@@ -166,7 +166,7 @@ IdentInfo* SymbolManager::getIDInfoFor(const Ident& id, const std::optional<Erro
             ErrCode::AMBIGUOUS_MEMBER,
             {
                 .str_1 = id.full_qualification.back().name,
-                .str_2 = id.full_qualification.at(id.full_qualification.size() - 2).name,
+                .str_2 = id.full_qualification[id.full_qualification.size() - 2].name,
                 .location = id.location
             });
         return nullptr;

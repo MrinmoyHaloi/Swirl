@@ -418,8 +418,8 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
         }
 
         case Op::CAST_OP: {
-            assert(node->operands.at(1)->getNodeType() == ND_TYPE);
-            context.bound_type = node->operands.at(1)->getSwType();
+            assert(node->operands[1]->getNodeType() == ND_TYPE);
+            context.bound_type = node->operands[1]->getSwType();
             context.cast_to = context.bound_type;
 
             return CGValue::rValue(
@@ -482,8 +482,8 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
             llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
             llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
 
-            auto lhs_type = fetchSwType(node->operands.at(0));
-            auto rhs_type = fetchSwType(node->operands.at(1));
+            auto lhs_type = fetchSwType(node->operands[0]);
+            auto rhs_type = fetchSwType(node->operands[1]);
 
             assert(lhs->getType() == rhs->getType());
 
@@ -502,8 +502,8 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
             llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
             llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
 
-            auto lhs_type = fetchSwType(node->operands.at(0));
-            auto rhs_type = fetchSwType(node->operands.at(1));
+            auto lhs_type = fetchSwType(node->operands[0]);
+            auto rhs_type = fetchSwType(node->operands[1]);
 
             assert(lhs->getType() == rhs->getType());
 
@@ -522,8 +522,8 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
             llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
             llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
 
-            auto lhs_type = fetchSwType(node->operands.at(0));
-            auto rhs_type = fetchSwType(node->operands.at(1));
+            auto lhs_type = fetchSwType(node->operands[0]);
+            auto rhs_type = fetchSwType(node->operands[1]);
 
             assert(lhs->getType() == rhs->getType());
 
@@ -542,8 +542,8 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
             llvm::Value* lhs = codegen(node->getLHS(), context).getRValue(*this, context);
             llvm::Value* rhs = codegen(node->getRHS(), context).getRValue(*this, context);
 
-            auto lhs_type = fetchSwType(node->operands.at(0));
-            auto rhs_type = fetchSwType(node->operands.at(1));
+            auto lhs_type = fetchSwType(node->operands[0]);
+            auto rhs_type = fetchSwType(node->operands[1]);
 
             assert(lhs->getType() == rhs->getType());
 
@@ -570,16 +570,16 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
 
         // (this case is quite unreadable, but only until operator overloading is implemented)
         case Op::INDEXING_OP: {
-            auto operand_llvm_ty = codegen(fetchSwType(node->operands.at(0)), context);
+            auto operand_llvm_ty = codegen(fetchSwType(node->operands[0]), context);
 
             // pointer indexing
             if (operand_llvm_ty->isPointerTy()) {
                 auto ptr_val = codegen(node->getLHS(), context).getRValue(*this, context);
-                context.bound_type = fetchSwType(node->operands.at(1));
+                context.bound_type = fetchSwType(node->operands[1]);
 
                 llvm::Value* idx = codegen(node->getRHS(), context).getRValue(*this, context);
 
-                auto container_sw_type = fetchSwType(node->operands.at(0));
+                auto container_sw_type = fetchSwType(node->operands[0]);
                 auto elem_sw_type = container_sw_type->getWrappedType();
                 auto elem_llvm_ty = codegen(elem_sw_type, context);
                 auto element_ptr = Builder.CreateGEP(elem_llvm_ty, ptr_val, idx);
@@ -601,11 +601,11 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
             auto arr_or_ptr_ptr = Builder.CreateStructGEP(
                 operand_llvm_ty, lhs_lvalue, 0);
 
-            context.bound_type = fetchSwType(node->operands.at(1));
-            llvm::Value* second_op = codegen(node->operands.at(1), context).getRValue(*this, context);
+            context.bound_type = fetchSwType(node->operands[1]);
+            llvm::Value* second_op = codegen(node->operands[1], context).getRValue(*this, context);
             llvm::Value* element_ptr;
 
-            auto container_sw_type = fetchSwType(node->operands.at(0));
+            auto container_sw_type = fetchSwType(node->operands[0]);
             auto elem_sw_type = container_sw_type == str_type ?
                 static_cast<Type*>(&GlobalTypeI8) :
                 container_sw_type->getWrappedType();
@@ -658,7 +658,7 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
         case Op::EXP: {
             auto* base = codegen(node->getLHS(), context).getRValue(*this, context);
 
-            context.bound_type = fetchSwType(node->operands.at(1));
+            context.bound_type = fetchSwType(node->operands[1]);
             auto* exp = codegen(node->getRHS(), context).getRValue(*this, context);
             auto* parent = Builder.GetInsertBlock()->getParent();
             auto* llvm_ty = base->getType();
@@ -718,14 +718,14 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
             // the LHS unwraps through any amount of expression-wrappers. the protocol cast
             // is detected via the cast target's resolved type, which sema always sets,
             // rather than `common_type` (left null when sema reported an error)
-            Node* receiver = node->operands.at(0);
-            auto* lhs_node = node->operands.at(0)->getWrappedNodeOrInstance();
+            Node* receiver = node->operands[0];
+            auto* lhs_node = node->operands[0]->getWrappedNodeOrInstance();
             if (lhs_node->getNodeType() == ND_OP) {
                 auto* lhs_op = lhs_node->to<Op>();
                 if (lhs_op->op_type == Op::CAST_OP) {
-                    auto* cast_target = lhs_op->operands.at(1)->getSwType();
+                    auto* cast_target = lhs_op->operands[1]->getSwType();
                     if (cast_target && cast_target->getTypeTag() == Type::PROTOCOL) {
-                        receiver = lhs_op->operands.at(0);
+                        receiver = lhs_op->operands[0];
                     }
                 }
             }
@@ -755,14 +755,14 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
             }
 
             // handle the special case of methods -- lower them into regular function calls
-            if (node->operands.at(1)->getNodeType() == ND_CALL) {
+            if (node->operands[1]->getNodeType() == ND_CALL) {
                 ComputedPtr = inst_ptr;  // set ComputedPtr for the FuncCall node to grab it
-                auto ret = codegen(node->operands.at(1), context);
+                auto ret = codegen(node->operands[1], context);
                 return ret;
             }
 
             assert(struct_ty != nullptr);
-            auto field_node = node->operands.at(1)->to<Ident>();
+            auto field_node = node->operands[1]->to<Ident>();
             auto field_ptr = Builder.CreateStructGEP(
                 codegen(struct_ty, context),
                 inst_ptr,
@@ -854,7 +854,7 @@ CGValue LLVMBackend::llvmCodegen(Op* node, SwContext context) {
             context.bound_type = node->common_type;
             auto lhs = Builder.CreateLoad(codegen(context.bound_type, context), lhs_ptr);
 
-            context.bound_type = fetchSwType(node->operands.at(1));
+            context.bound_type = fetchSwType(node->operands[1]);
             auto rhs = codegen(node->getRHS(), context).getRValue(*this, context);
             auto* parent = Builder.GetInsertBlock()->getParent();
             auto* entry = Builder.GetInsertBlock();
@@ -1095,7 +1095,7 @@ CGValue LLVMBackend::llvmCodegen(WhileLoop* node, SwContext context) {
 /// returns a load of it.
 CGValue LLVMBackend::llvmCodegen(ArrayLit* node, const SwContext& context) {
     assert(!node->elements.empty());
-    Type* element_type = node->elements.at(0)->expr_type;
+    Type* element_type = node->elements[0]->expr_type;
     Type* sw_arr_type  = TypeManager.getArrayType(element_type, node->elements.size());
 
     if (!isLocalScope()) {
@@ -1222,7 +1222,7 @@ CGValue LLVMBackend::llvmCodegen(ContinueStmt* node, const SwContext& context) {
 CGValue LLVMBackend::llvmCodegen(Intrinsic* node, const SwContext& context) {
     switch (node->intrinsic_type) {
         case Intrinsic::SIZEOF: {
-            llvm::Type* val_type = codegen(node->args.at(0), context).getRValue(*this, context)->getType();
+            llvm::Type* val_type = codegen(node->args[0], context).getRValue(*this, context)->getType();
             if (val_type->isPointerTy()) {
                 return CGValue::rValue(toLLVMInt(getDataLayout().getPointerSize(0)), &GlobalTypeI64);
             } if (val_type->isVoidTy()) {
@@ -1232,19 +1232,19 @@ CGValue LLVMBackend::llvmCodegen(Intrinsic* node, const SwContext& context) {
                 &GlobalTypeI64);
         }
         case Intrinsic::TYPEOF:
-            return codegen(node->args.at(0), context);
+            return codegen(node->args[0], context);
         case Intrinsic::ADV_PTR: {
             assert(node->args.size() == 2);
-            assert(node->args.at(0)->expr_type->isPointerType());
-            assert(node->args.at(1)->expr_type->isIntegral());
+            assert(node->args[0]->expr_type->isPointerType());
+            assert(node->args[1]->expr_type->isIntegral());
 
-            llvm::Value* ptr = codegen(node->args.at(0), context).getRValue(*this, context);
-            std::array operands{codegen(node->args.at(1), context).getRValue(*this, context)};
+            llvm::Value* ptr = codegen(node->args[0], context).getRValue(*this, context);
+            std::array operands{codegen(node->args[1], context).getRValue(*this, context)};
 
             return CGValue::rValue(Builder.CreateGEP(
-                codegen(node->args.at(0)->expr_type->getWrappedType(), context),
+                codegen(node->args[0]->expr_type->getWrappedType(), context),
                 ptr, operands
-            ), node->args.at(0)->expr_type);
+            ), node->args[0]->expr_type);
         }
 
         default:

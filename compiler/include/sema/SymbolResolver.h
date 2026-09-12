@@ -124,7 +124,7 @@ struct SymbolResolver : SemaVisitor<SymbolResolver> {
             }
 
             if (arg->isType()) {
-                data.generic_args.insert({generic_params->at(i)->name, arg->getType()->type_id}); // TODO
+                data.generic_args.insert({(*(generic_params))[i]->name, arg->getType()->type_id}); // TODO
             }
         }
 
@@ -137,7 +137,7 @@ struct SymbolResolver : SemaVisitor<SymbolResolver> {
     void handle(const Op* node, Data data) {
         if (node->op_type == Op::DOT) {
             // only visit LHS; RHS method-name Ident is handled by TypeResolver::evaluateType(Op*)
-            visit(node->operands.at(0), std::move(data));
+            visit(node->operands[0], std::move(data));
         } else {
             for (auto& operand : node->operands) {
                 visit(operand, data);

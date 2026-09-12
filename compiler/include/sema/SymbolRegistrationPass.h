@@ -96,13 +96,13 @@ public:
         if (node->value) return;
 
         // attempt to resolve possibly local symbols
-        if (node->full_qualification.size() == 1 && node->full_qualification.at(0).generic_args.empty()) {
+        if (node->full_qualification.size() == 1 && node->full_qualification[0].generic_args.empty()) {
             if (const auto result = searchForSymbol(node->full_qualification.front().name)) {
                 node->value = result;
             }
         }
 
-        for (auto& [_, generic_args, _] : node->full_qualification ) {
+        for (auto& [name, generic_args, value] : node->full_qualification ) {
             for (GenericArg* arg : generic_args) {
                 visit(arg);
             }

@@ -340,13 +340,13 @@ public:
                 case Intrinsic::ADV_PTR: {
                     assert(node->args.size() == 2);
 
-                    inferType(node->args.at(0), ctx);
-                    inferType(node->args.at(1), ctx);
+                    inferType(node->args[0], ctx);
+                    inferType(node->args[1], ctx);
 
                     if (node->args.size() < 2) {
                         reportError(ErrCode::TOO_FEW_ARGS, {});
                         return {};
-                    } res = node->args.at(0)->expr_type;
+                    } res = node->args[0]->expr_type;
                     break;
                 }
                 default: res = deduced_type;
@@ -450,7 +450,7 @@ public:
                         if (ctx.is_method_call && fn_node->params.front()->is_instance_param)
                             arg_idx -= 1;
 
-                        const auto arg_node = node->args.at(arg_idx);
+                        const auto arg_node = node->args[arg_idx];
                         is_valid &= checkTypeCompatibility(
                             ty, variadic_ty->type, true, arg_node->location);
                     }
@@ -517,15 +517,15 @@ public:
         // check the type compatibility between the function signature and the arguments
         for (std::size_t i = 0; i < node->args.size(); i++) {
             const std::size_t index = i + (ctx.is_method_call ? 1 : 0);
-            const auto arg_type = inferType(node->args.at(i), {
+            const auto arg_type = inferType(node->args[i], {
                 .bound_type = fn_type->param_types.at(index)
             });
 
             checkTypeCompatibility(
                 arg_type.deduced_type,
-                fn_type->param_types.at(index),
-                true, node->args.at(i)->location);
-            node->args.at(i)->setType(fn_type->param_types.at(index));
+                fn_type->param_types[index],
+                true, node->args[i]->location);
+            node->args[i]->setType(fn_type->param_types[index]);
         }
 
         return {.deduced_type = fn_type->ret_type};

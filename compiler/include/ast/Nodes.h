@@ -292,12 +292,12 @@ struct Op final : Node {
 
     [[nodiscard]] Node* getLHS() const {
         assert(!operands.empty());
-        return operands.at(0);
+        return operands[0];
     }
 
     [[nodiscard]] Node* getRHS() const {
         assert(operands.size() >= 2);
-        return operands.at(1);
+        return operands[1];
     }
 
     static int getLBPFor(OpTag_t op);
@@ -413,7 +413,7 @@ struct GenericArgList final : Node {
     [[nodiscard]] auto size()    const { return generic_args.size(); }
     [[nodiscard]] bool empty()   const { return generic_args.empty(); }
 
-    [[nodiscard]] auto at(const std::size_t i) const { return generic_args.at(i); }
+    [[nodiscard]] auto at(const std::size_t i) const { return generic_args[i]; }
 };
 
 
@@ -677,7 +677,7 @@ struct Intrinsic final : Node {
             {"memset", MEMSET},
             {"memcpy", MEMCPY},
             {"advance_pointer", ADV_PTR}
-        }; intrinsic_type = tag_map.at(ident->full_qualification.at(0).name);
+        }; intrinsic_type = tag_map.at(ident->full_qualification[0].name);
     }
 
     [[nodiscard]] NodeType getNodeType() const override { return ND_INTRINSIC; }

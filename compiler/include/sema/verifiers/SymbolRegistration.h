@@ -27,7 +27,7 @@ public:
         if (!ident->value && !m_IsLocalScope && !m_Module->isErroneous()) {
             SW_LOG_FATAL(
                 "SymbolRegistration: verification failed in {}. Local identifier at {} unresolved.",
-                m_Module->file_handle->getPath(), ident->location.toString());
+                m_Module->file_handle->getPath().string(), ident->location.toString());
             m_IsErroneous = true;
         }
     }

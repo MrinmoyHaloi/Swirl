@@ -168,7 +168,7 @@ private:
     std::optional<Value> evaluateComptimeOps(const Op* node) const {
         switch (node->op_type) {
             case Op::SIZEOF: {
-                const auto operand_ty = node->operands.at(0)->getWrappedNodeOrInstance();
+                const auto operand_ty = node->operands[0]->getWrappedNodeOrInstance();
                 assert(operand_ty->getNodeType() == ND_TYPE);
 
                 const auto ty = operand_ty->to<TypeWrapper>()->type;
@@ -177,7 +177,7 @@ private:
                 return Value::makeInt(m_Module->getTarget().getSizeInBits(ty) / 8);
             }
             case Op::ALIGNOF: {
-                const auto operand_ty = node->operands.at(0)->getWrappedNodeOrInstance();
+                const auto operand_ty = node->operands[0]->getWrappedNodeOrInstance();
                 assert(operand_ty->getNodeType() == ND_TYPE);
 
                 const auto ty = operand_ty->to<TypeWrapper>()->type;
@@ -259,17 +259,17 @@ private:
     Value compute(const Op* node, const Context ctx) {
         // check for and handle special operators first
         if (node->op_type == Op::CAST_OP) {
-            const Value src = evaluate(node->operands.at(0), ctx);
+            const Value src = evaluate(node->operands[0], ctx);
             if (src.type == Value::INVALID) return {};
-            return castValue(src, node->operands.at(1)->getSwType());
+            return castValue(src, node->operands[1]->getSwType());
         }
 
         if (const auto res = evaluateComptimeOps(node)) {
             return res.value();
         }
 
-        const Value operand_1 = evaluate(node->operands.at(0), ctx);
-        const Value operand_2 = node->arity == 2 ? evaluate(node->operands.at(1), ctx) : Value{};
+        const Value operand_1 = evaluate(node->operands[0], ctx);
+        const Value operand_2 = node->arity == 2 ? evaluate(node->operands[1], ctx) : Value{};
 
         if (operand_1.type == Value::INVALID || (node->arity == 2 && operand_2.type == Value::INVALID)) {
             return Value{};

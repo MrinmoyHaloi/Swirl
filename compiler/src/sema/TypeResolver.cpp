@@ -165,7 +165,7 @@ sema::TypeResolver::TypeInfo sema::TypeResolver::evaluateType(Op* node, const Ty
     TypeInfo ret{};
 
     // 1st operand
-    auto analysis_1 = inferType(node->operands.at(0), ctx);
+    auto analysis_1 = inferType(node->operands[0], ctx);
     TypeInfo analysis_2{};
 
     if (analysis_1.deduced_type == nullptr)
@@ -202,10 +202,10 @@ sema::TypeResolver::TypeInfo sema::TypeResolver::evaluateType(Op* node, const Ty
             case Op::ALIGNOF:
             case Op::SIZEOF:
                 // substitute the expression with a type equal to the inferred type of the expression
-                if (node->operands.at(0)->getNodeType() == ND_EXPR &&
-                    node->operands.at(0)->getWrappedNodeOrInstance()->getNodeType() != ND_TYPE)
+                if (node->operands[0] -> getNodeType() == ND_EXPR &&
+                    node->operands[0]->getWrappedNodeOrInstance()->getNodeType() != ND_TYPE)
                     {
-                    const auto [deduced_type, _] = inferType(node->operands.at(0), {});
+                    const auto [deduced_type, _] = inferType(node->operands[0], {});
                     node->operands[0] = makeNode<TypeWrapper>(deduced_type);
                     }
                 ret.deduced_type = &GlobalTypeI64;
@@ -220,7 +220,7 @@ sema::TypeResolver::TypeInfo sema::TypeResolver::evaluateType(Op* node, const Ty
             node->op_type != Op::CAST_OP         &&
             node->op_type != Op::DOT             &&
             node->op_type != Op::ASSIGNMENT      ?
-            inferType(node->operands.at(1), {.bound_type = analysis_1.deduced_type}) :
+            inferType(node->operands[1], {.bound_type = analysis_1.deduced_type}) :
             TypeInfo{};
 
         switch (node->op_type) {
@@ -264,12 +264,12 @@ sema::TypeResolver::TypeInfo sema::TypeResolver::evaluateType(Op* node, const Ty
                 //     reportError(ErrCode::CANNOT_ASSIGN_TO_CONST, {});
                 // }
 
-                analysis_2 = inferType(node->operands.at(1), {.bound_type = analysis_1.deduced_type});
+                analysis_2 = inferType(node->operands[1], {.bound_type = analysis_1.deduced_type});
 
                 checkTypeCompatibility(
                     analysis_2.deduced_type,
                     analysis_1.deduced_type,
-                    true, node->operands.at(1)->location);
+                    true, node->operands[1]->location);
 
                 ret.deduced_type = unify(analysis_1.deduced_type, analysis_2.deduced_type);
                 break;
@@ -296,8 +296,8 @@ sema::TypeResolver::TypeInfo sema::TypeResolver::evaluateType(Op* node, const Ty
             }
 
             case Op::CAST_OP: {
-                inferType(node->operands.at(1), ctx);
-                ret.deduced_type = node->operands.at(1)->getSwType();
+                inferType(node->operands[1], ctx);
+                ret.deduced_type = node->operands[1]->getSwType();
 
                 // casting to a protocol is a scope-selector: the casted value's
                 // static type must implement the protocol, otherwise there is no
@@ -351,7 +351,7 @@ sema::TypeResolver::TypeInfo sema::TypeResolver::evaluateType(Op* node, const Ty
                     {
                         auto* protocol_ty = analysis_result.deduced_type->to<ProtocolConstraint>();
                         auto* concrete_type =
-                            inferType(lhs_node->to<Op>()->operands.at(0), ctx).deduced_type;
+                            inferType(lhs_node->to<Op>()->operands[0], ctx).deduced_type;
                         if (!concrete_type)
                             return {};
 

@@ -1,5 +1,6 @@
 #include <string>
 #include <definitions.h>
+#include <array>
 
 #include "lexer/TokenStream.h"
 #include "lexer/Tokens.h"

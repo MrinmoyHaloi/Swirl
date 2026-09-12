@@ -2,6 +2,7 @@
 #include <cassert>
 #include <string>
 #include <thread>
+#include <span>
 #include <condition_variable>
 
 namespace fs = std::filesystem;

@@ -9,6 +9,8 @@ configure_file(
         NEWLINE_STYLE LF
 )
 
+set(LLVM_DIR "C:\\Users\\mrinm\\llvm-dist\\lib\\cmake\\llvm")
+set(LLD_DIR "C:\\Users\\mrinm\\llvm-dist\\lib\\cmake\\lld")
 
 find_package(LLVM REQUIRED CONFIG)
 find_package(LLD REQUIRED CONFIG)
@@ -23,12 +25,15 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 option(LLVM_LINK_SHARED "Link against shared LLVM libraries" ON)
 option(BUILD_TESTS "Build unit tests" OFF)
 
+option(LLVM_LINK_STATIC "Link against shared LLVM libraries" ON)
+message("llvm dir: ${LLVM_DIR}")
 include_directories("include")
 include_directories("${PROJECT_BINARY_DIR}")
 
 file(GLOB_RECURSE SOURCES "src/*.cpp")
 
 add_executable(swirl src/swirl.cpp "${SOURCES}")
+target_compile_options(swirl PRIVATE /std:c++latest /Zc:preprocessor)
 
 # address sanitizer
 #target_compile_options(swirl PRIVATE -fsanitize=address -fno-omit-frame-pointer)
