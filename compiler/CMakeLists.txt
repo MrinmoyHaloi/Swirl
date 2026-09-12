@@ -40,6 +40,7 @@ install(TARGETS swirl
 
 if(WIN32)
     if(MSVC)
+        target_compile_options(swirl PRIVATE /Zc:preprocessor)
         set(LLD_LIBS
             lldCOFF
             lldCommon
