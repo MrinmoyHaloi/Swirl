@@ -49,7 +49,7 @@ jobs:
       - name: Download LLVM
         run: |
           if [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
-            curl -L -o llvm-linux.tar.gz https://github.com/SwirlLang/llvm-builds/releases/download/20.1.8/LLVM-20.1.8-linux-x86_64-gcc.tar.gz
+            curl -L -o llvm-linux.tar.gz https://github.com/SwirlLang/llvm-builds/releases/download/22.1.8/LLVM-22.1.8-linux-x86_64-gcc.tar.gz
             mkdir -p $HOME/llvm
             tar -xzf llvm-linux.tar.gz -C $HOME/llvm
             # set PATH for llvm tools
@@ -57,7 +57,7 @@ jobs:
             echo "LLD_DIR=$HOME/llvm/lib/cmake/lld" >> $GITHUB_ENV
           fi
           if [ "${{ matrix.os }}" == "windows-latest" ]; then
-            curl -L -o llvm-windows.rar https://github.com/SwirlLang/llvm-builds/releases/download/20.1.8/LLVM-20.1.8-windows-x86_64-msvc.rar
+            curl -L -o llvm-windows.rar https://github.com/SwirlLang/llvm-builds/releases/download/22.1.8/LLVM-22.1.8-windows-x86_64-msvc.rar
             7z x llvm-windows.rar -o$HOME/llvm
             # set PATH for llvm tools
             echo "LLVM_DIR=$HOME/llvm/lib/cmake/llvm" >> $GITHUB_ENV
@@ -67,10 +67,10 @@ jobs:
       - name: Install dependencies and Configure CMake
         run: |
             if [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
-                cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DLLVM_LINK_STATIC=ON -S . -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14
+                cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DLLVM_LINK_STATIC=ON -S . -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
             fi
             if [ "${{ matrix.os }}" == "windows-latest" ]; then
-              cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DLLVM_LINK_STATIC=ON -S . -G "Visual Studio 17 2022" -A x64
+              cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DLLVM_LINK_STATIC=ON -S . -G "Visual Studio 18 2026" -A x64
             fi
 
       - name: Build
@@ -129,15 +129,11 @@ jobs:
           merge-multiple: true
           path: .
 
-      - name: Generate release notes
-        run: npx git-cliff@latest --unreleased --tag ${{github.event.inputs.version_number}} --output CHANGELOG.md
-
       - name: Creating GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: v${{github.event.inputs.version_number}}
           tag_name: v${{github.event.inputs.version_number}}
           target_commitish: ${{github.event.inputs.sha}}
-          body_path: CHANGELOG.md
           files: |
             swirl-*
