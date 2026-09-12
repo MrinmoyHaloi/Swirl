@@ -48,7 +48,7 @@ jobs:
 
       - name: Download LLVM
         run: |
-          if [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
+          if [ "${{ matrix.os }}" == "ubuntu-26.04" ]; then
             curl -L -o llvm-linux.tar.gz https://github.com/SwirlLang/llvm-builds/releases/download/22.1.8/LLVM-22.1.8-linux-x86_64-gcc.tar.gz
             mkdir -p $HOME/llvm
             tar -xzf llvm-linux.tar.gz -C $HOME/llvm
